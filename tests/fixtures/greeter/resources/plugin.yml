@@ -15,6 +15,9 @@ commands:
   greet:
     description: Greet everyone, or yourself
     usage: /greet <all|me>
+  seen:
+    description: When a player last left
+    usage: /seen <player>
 permissions:
   greeter.heal:
     default: op

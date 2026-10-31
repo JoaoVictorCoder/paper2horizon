@@ -63,6 +63,9 @@ fn the_crate_has_every_part() {
     for want in [
         "ctx.save_default_config(include_str!(\"../config.yml\"));",
         "pub joins: i32,",
+        "use std::collections::{HashMap, HashSet};",
+        "pub last_seen: HashMap<Uuid, i64>,",
+        "pub muted: HashSet<Uuid>,",
         "left out, no Horizon event for EntityDamageEvent",
         "ctx.set_executor(\"heal\"",
         "ctx.set_executor(\"spawn\"",
@@ -71,8 +74,11 @@ fn the_crate_has_every_part() {
         assert!(lib.contains(want), "lib.rs lacks {want}\n{lib}");
     }
     let md = generate::porting_md(&a, "greeter.jar", &generated);
-    assert!(md.contains("| Listeners | 4 (3 with a Horizon event) |"), "{md}");
-    assert!(md.contains("| Translated to Rust | 8 of 10 listeners, commands, completers, tasks and helpers |"), "{md}");
+    assert!(md.contains("| Listeners | 6 (5 with a Horizon event) |"), "{md}");
+    assert!(
+        md.contains("| Translated to Rust | 12 of 14 listeners, commands, completers, tasks and helpers |"),
+        "{md}"
+    );
     assert!(md.contains("`Player.setHealth`"));
     assert!(!md.contains("<init>"));
 }
@@ -135,6 +141,32 @@ fn bodies_are_translated() {
             }
             true
         });",
+        // State in the plugin's collections.
+        "        ctx.on(|plugin, _ctx, e: &mut PlayerQuitEvent| {
+            let id = e.player.uuid;
+            plugin.last_seen.insert(id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64));
+            plugin.muted.remove(&id);
+        });",
+        "            if plugin.muted.contains(&e.player.uuid) {
+                e.set_cancelled(true);
+            } else if e.message.contains(\"spam\") {
+                plugin.muted.insert(e.player.uuid);
+            }",
+        // What may be null: `let ... else` when the null case leaves, `if let` otherwise.
+        "            let Some(target) = server().match_player(&args[0]) else {
+                sender.send_message(&format!(\"{}{} isn't online.\", ChatColor::Red, args[0]));
+                return true;
+            };
+            let last = plugin.last_seen.get(&target.uuid).cloned();
+            if let Some(last) = last {",
+        // A list made in the body.
+        "            let mut names: Vec<String> = Vec::new();
+            for p in server().online_players() {
+                if !plugin.muted.contains(&p.uuid) {
+                    names.push(p.name.clone());
+                }
+            }
+            names",
     ];
     for want in expect {
         assert!(lib.contains(want), "lib.rs lacks\n{want}\n\n{lib}");

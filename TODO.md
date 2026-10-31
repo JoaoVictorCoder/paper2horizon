@@ -2,17 +2,19 @@
 
 ## Next
 
-What keeps bodies from translating, most common first (66 small plugins from Modrinth, 18 of 277 translated):
+What keeps bodies from translating, most common first (66 small plugins from Modrinth, 23 of 277 translated):
 
-- [ ] State in collections: fields typed `Map<UUID, Long>`, `Set<UUID>`, `List<String>` (from their generic
-      `Signature`) as `HashMap`, `HashSet`, `Vec`, with `get` giving an `Option`.
-- [ ] `null`: `Option` for what can be missing (`Bukkit.getPlayer(name)`, `map.get(k)`), `if (x != null)` as
-      `if let Some(x)`.
+- [ ] Fields of listener and command classes other than the plugin reference (`HungerListener.lastFoodLevels`,
+      `PlayerSitListener.seatManager`): fields of the plugin's struct. Now the most common blocker.
 - [ ] Static fields and singletons (`Main.getInstance()`, `ConfigHandler.INSTANCE`): the plugin itself.
-- [ ] Fields of listener and command classes other than the plugin reference: fields of the plugin's struct.
 - [ ] `try { Integer.parseInt(s) } catch (NumberFormatException e)` as `match s.parse::<i32>()`.
 - [ ] `||` in conditions, `?:`, `continue` and `break` in loops, index loops (`for (int i = 0; ...)`).
 - [ ] Lambdas inside bodies (`runTaskLater(this, () -> ..., 20L)` in a listener): closures.
+- [x] State in collections: fields typed `Map<UUID, Long>`, `Set<UUID>`, `List<String>` (from their generic
+      `Signature`) as `HashMap`, `HashSet`, `Vec`; `new ArrayList<>()` in a body, typed by its local's signature.
+- [x] `null`: `Option` for what can be missing (`Bukkit.getPlayer(name)`, `map.get(k)`); `if (x != null)` as
+      `if let Some(x) = x`, `if (x == null) return` as `let Some(x) = ... else`.
+- [ ] `Option` for the plugin's own fields that start `null`, and helpers that return `null`.
 - [x] Translate method bodies: listeners, commands, completers, tasks, and the plugin's own methods they call, with
       `cargo check` taking back what doesn't compile.
 - [x] Read the delay and period a scheduler call passes.

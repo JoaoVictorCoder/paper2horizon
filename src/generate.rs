@@ -694,6 +694,15 @@ pub fn lib_rs(a: &Analysis, has_config: bool, disabled: &BTreeSet<String>) -> Ge
     g.line("//! PORTING.md has the whole list.");
     g.line("");
     g.line("use horizon_plugin_api::prelude::*;");
+    let collections: Vec<&str> = ["HashMap", "HashSet"]
+        .into_iter()
+        .filter(|c| a.fields.values().any(|f| f.ty.starts_with(&format!("{c}<"))))
+        .collect();
+    match collections.as_slice() {
+        [] => {}
+        [one] => g.line(&format!("use std::collections::{one};")),
+        all => g.line(&format!("use std::collections::{{{}}};", all.join(", "))),
+    }
     g.line("");
     g.plugin_struct(&name);
     g.line(&format!("impl Plugin for {name} {{"));

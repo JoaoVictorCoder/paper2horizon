@@ -58,10 +58,23 @@ ctx.set_executor("greet", |_plugin, _ctx, sender, _label, args| {
 });
 ```
 
+The plugin's collections become Rust's, from the fields' generic types (`Map<UUID, Long>` → `HashMap<Uuid, i64>`),
+and what Java may give as `null` is an `Option`:
+
+```rust
+let Some(target) = server().match_player(&args[0]) else {
+    sender.send_message(&format!("{}{} isn't online.", ChatColor::Red, args[0]));
+    return true;
+};
+let last = plugin.last_seen.get(&target.uuid).cloned();
+if let Some(last) = last {
+```
+
 Read translated code over: Java's `null` and Rust's defaults differ (`getConfig().getString(path)` is `""` here when
-the key is missing, not `null`). On 66 small plugins from Modrinth, 18 of 277 bodies translate today, and every
-crate compiles; most of the rest keep state in collections (`Map<UUID, Long>`, `Set<UUID>`) or singletons, which is
-next (TODO.md).
+the key is missing, not `null`), and a value Java reads without a check (`map.get(k).longValue()`) is `map[&k]`, which
+panics where Java would throw (the plugin's runtime catches and logs both). On 66 small plugins from Modrinth, 23 of
+277 bodies translate today, and every crate compiles; most of the rest keep their state in the fields of other classes
+(a listener's own map, a static singleton), which is next (TODO.md).
 
 ## Use
 

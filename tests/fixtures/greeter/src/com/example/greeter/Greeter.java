@@ -1,5 +1,10 @@
 package com.example.greeter;
 
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Material;
@@ -11,11 +16,15 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.player.AsyncPlayerChatEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 
 public final class Greeter extends JavaPlugin implements Listener, CommandExecutor {
     private int joins;
+    final Map<UUID, Long> lastSeen = new HashMap<>();
+    final Set<UUID> muted = new HashSet<>();
 
     @Override
     public void onEnable() {
@@ -26,6 +35,8 @@ public final class Greeter extends JavaPlugin implements Listener, CommandExecut
         getCommand("heal").setTabCompleter(new HealCommand(this));
         getCommand("spawn").setExecutor(this);
         getCommand("greet").setExecutor(new GreetCommand());
+        getCommand("seen").setExecutor(new SeenCommand(this));
+        getCommand("seen").setTabCompleter(new SeenCommand(this));
         Bukkit.getScheduler().runTaskTimer(this, () -> Bukkit.broadcastMessage(ChatColor.YELLOW + "Joins so far: " + joins), 20L, 1200L);
         getLogger().info("Greeter ready");
     }
@@ -35,6 +46,22 @@ public final class Greeter extends JavaPlugin implements Listener, CommandExecut
         joins++;
         greet(event.getPlayer());
         event.setJoinMessage(null);
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent event) {
+        UUID id = event.getPlayer().getUniqueId();
+        lastSeen.put(id, System.currentTimeMillis());
+        muted.remove(id);
+    }
+
+    @EventHandler
+    public void onChat(AsyncPlayerChatEvent event) {
+        if (muted.contains(event.getPlayer().getUniqueId())) {
+            event.setCancelled(true);
+        } else if (event.getMessage().contains("spam")) {
+            muted.add(event.getPlayer().getUniqueId());
+        }
     }
 
     /** A helper of the plugin's own, calling a static one of another class. */

@@ -22,6 +22,8 @@ pub struct Field {
     /// `I`, `Ljava/lang/String;`.
     pub descriptor: String,
     pub is_static: bool,
+    /// The generic type, when it has one: `Ljava/util/Map<Ljava/util/UUID;Ljava/lang/Long;>;`.
+    pub signature: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -53,6 +55,8 @@ pub struct LocalVar {
     pub len: u16,
     pub name: String,
     pub descriptor: String,
+    /// The generic type, from `LocalVariableTypeTable`.
+    pub signature: Option<String>,
 }
 
 /// A constant `ldc` loads.
@@ -355,8 +359,16 @@ pub fn parse(bytes: &[u8]) -> Result<Class, String> {
         let access = r.u16()?;
         let name = pool.utf8(r.u16()?).unwrap_or_default().to_owned();
         let descriptor = pool.utf8(r.u16()?).unwrap_or_default().to_owned();
-        skip_attributes(&mut r)?;
-        fields.push(Field { name, descriptor, is_static: access & 0x0008 != 0 });
+        let mut signature = None;
+        for _ in 0..r.u16()? {
+            let attr = pool.utf8(r.u16()?).unwrap_or_default();
+            let len = r.u32()? as usize;
+            let body = r.take(len)?;
+            if attr == "Signature" && len == 2 {
+                signature = pool.utf8(u16::from_be_bytes([body[0], body[1]])).map(str::to_owned);
+            }
+        }
+        fields.push(Field { name, descriptor, is_static: access & 0x0008 != 0, signature });
     }
     let mut raw_methods = Vec::new();
     for _ in 0..r.u16()? {
@@ -413,7 +425,8 @@ fn read_body(body: &[u8], pool: &Pool) -> Result<Body, String> {
     let code = r.take(len)?.to_vec();
     let handlers = r.u16()? as usize;
     r.take(handlers * 8)?;
-    let mut locals = Vec::new();
+    let mut locals: Vec<LocalVar> = Vec::new();
+    let mut signatures = Vec::new();
     for _ in 0..r.u16()? {
         let attr = pool.utf8(r.u16()?).unwrap_or_default().to_owned();
         let n = r.u32()? as usize;
@@ -424,20 +437,25 @@ fn read_body(body: &[u8], pool: &Pool) -> Result<Body, String> {
                 let (start, len) = (l.u16()?, l.u16()?);
                 let name = pool.utf8(l.u16()?).unwrap_or_default().to_owned();
                 let descriptor = pool.utf8(l.u16()?).unwrap_or_default().to_owned();
-                locals.push(LocalVar { slot: l.u16()?, start, len, name, descriptor });
+                locals.push(LocalVar { slot: l.u16()?, start, len, name, descriptor, signature: None });
+            }
+        } else if attr == "LocalVariableTypeTable" {
+            let mut l = Reader { bytes: data, at: 0 };
+            for _ in 0..l.u16()? {
+                let (start, len) = (l.u16()?, l.u16()?);
+                let name = pool.utf8(l.u16()?).unwrap_or_default().to_owned();
+                let signature = pool.utf8(l.u16()?).unwrap_or_default().to_owned();
+                let slot = l.u16()?;
+                signatures.push((slot, start, len, name, signature));
             }
         }
     }
-    Ok(Body { code, handlers, locals })
-}
-
-fn skip_attributes(r: &mut Reader) -> Result<(), String> {
-    for _ in 0..r.u16()? {
-        r.u16()?;
-        let n = r.u32()? as usize;
-        r.take(n)?;
+    for (slot, start, _, name, signature) in signatures {
+        if let Some(l) = locals.iter_mut().find(|l| l.slot == slot && l.start == start && l.name == name) {
+            l.signature = Some(signature);
+        }
     }
-    Ok(())
+    Ok(Body { code, handlers, locals })
 }
 
 fn read_annotations(body: &[u8], pool: &Pool) -> Result<Vec<Annotation>, String> {

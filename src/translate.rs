@@ -54,6 +54,14 @@ pub enum Kind {
     StrList,
     /// A `Vec<Player>`.
     PlayerList,
+    /// A `Vec` of something other than text: a field's or a local's.
+    List(Box<Kind>),
+    /// A `HashMap`, by its keys' and values' kinds.
+    Map(Box<Kind>, Box<Kind>),
+    /// A `HashSet`.
+    Set(Box<Kind>),
+    /// An `Option`: what Java may give as `null` (`map.get`, `Bukkit.getPlayer`).
+    Opt(Box<Kind>),
     Uuid,
     /// A collection's iterator (in a for-each loop), by what it iterates and the items' kind.
     Iter(String, Box<Kind>),
@@ -67,6 +75,8 @@ pub enum Kind {
     Null,
     /// A `new` whose constructor hasn't run yet.
     New(String),
+    /// A new empty collection (`Vec`, `HashMap`, `HashSet`), typed by where it goes.
+    Empty(&'static str),
     /// A `StringBuilder` and what was appended to it.
     Builder(Vec<Expr>),
     /// A `new String[n]` being filled.
@@ -252,7 +262,7 @@ pub fn param_names(m: &Method) -> Vec<String> {
 pub struct PluginField {
     pub rust: String,
     pub kind: Kind,
-    pub ty: &'static str,
+    pub ty: String,
     /// Its value at construction, when the Java constructor sets a constant.
     pub init: Option<String>,
 }
@@ -291,6 +301,13 @@ enum Stmt {
     For {
         var: String,
         iter: String,
+        body: Vec<Stmt>,
+    },
+    /// `let Some(name) = name else { body };`: a `null` check that leaves.
+    LetElse {
+        name: String,
+        /// What it's set from, when that's right here: `let Some(x) = f() else`.
+        value: Option<String>,
         body: Vec<Stmt>,
     },
     /// A switch: each arm's patterns and body, and the default's.
@@ -445,6 +462,11 @@ fn render(stmts: &[Stmt], depth: usize, out: &mut Vec<String>) {
             Stmt::Line(l) => out.push(format!("{pad}{l}")),
             Stmt::Return(None) => out.push(format!("{pad}return;")),
             Stmt::Return(Some(v)) => out.push(format!("{pad}return {v};")),
+            Stmt::LetElse { name, value, body } => {
+                out.push(format!("{pad}let Some({name}) = {} else {{", value.as_deref().unwrap_or(name)));
+                render(body, depth + 1, out);
+                out.push(format!("{pad}}};"));
+            }
             Stmt::For { var, iter, body } => {
                 out.push(format!("{pad}for {var} in {iter} {{"));
                 render(body, depth + 1, out);
@@ -512,6 +534,9 @@ fn steal(stmts: &[Stmt]) -> Vec<Stmt> {
             Stmt::Return(v) => Stmt::Return(v.clone()),
             Stmt::If { cond, then, els } => Stmt::If { cond: cond.clone(), then: steal(then), els: steal(els) },
             Stmt::For { var, iter, body } => Stmt::For { var: var.clone(), iter: iter.clone(), body: steal(body) },
+            Stmt::LetElse { name, value, body } => {
+                Stmt::LetElse { name: name.clone(), value: value.clone(), body: steal(body) }
+            }
             Stmt::Match { on, arms, default } => Stmt::Match {
                 on: on.clone(),
                 arms: arms.iter().map(|(p, b)| (p.clone(), steal(b))).collect(),
@@ -552,18 +577,104 @@ pub fn snake(java: &str) -> String {
     out
 }
 
-/// A Java field or local's descriptor as a Rust kind and type, for the simple ones.
-pub fn field_kind(descriptor: &str) -> Option<(Kind, &'static str)> {
-    Some(match descriptor {
-        "I" | "S" | "B" => (Kind::I32, "i32"),
-        "J" => (Kind::I64, "i64"),
-        "D" => (Kind::F64, "f64"),
-        "F" => (Kind::F32, "f32"),
-        "Z" => (Kind::Bool, "bool"),
-        "C" => (Kind::Char, "char"),
-        "Ljava/lang/String;" => (Kind::Str, "String"),
+/// A Java field or local's type as a Rust kind and type: the simple ones, and the collections of
+/// them its generic `signature` tells (`Map<UUID, Long>` → `HashMap<Uuid, i64>`).
+pub fn field_kind(descriptor: &str, signature: Option<&str>) -> Option<(Kind, String)> {
+    let simple = |k: Kind, t: &str| Some((k, t.to_owned()));
+    match descriptor {
+        "I" | "S" | "B" => simple(Kind::I32, "i32"),
+        "J" => simple(Kind::I64, "i64"),
+        "D" => simple(Kind::F64, "f64"),
+        "F" => simple(Kind::F32, "f32"),
+        "Z" => simple(Kind::Bool, "bool"),
+        "C" => simple(Kind::Char, "char"),
+        "Ljava/lang/String;" => simple(Kind::Str, "String"),
+        _ => {
+            let (class, args) = generic(signature?)?;
+            let item = |i: usize| args.get(i).and_then(|a| boxed_kind(a));
+            match collection(&class)? {
+                "Vec" if args.len() == 1 => {
+                    let (k, t) = item(0)?;
+                    let kind = if k == Kind::Str { Kind::StrList } else { Kind::List(Box::new(k)) };
+                    Some((kind, format!("Vec<{t}>")))
+                }
+                "HashSet" if args.len() == 1 => {
+                    let (k, t) = item(0).filter(|(k, _)| hashable(k))?;
+                    Some((Kind::Set(Box::new(k)), format!("HashSet<{t}>")))
+                }
+                "HashMap" if args.len() == 2 => {
+                    let (k, kt) = item(0).filter(|(k, _)| hashable(k))?;
+                    let (v, vt) = item(1)?;
+                    Some((Kind::Map(Box::new(k), Box::new(v)), format!("HashMap<{kt}, {vt}>")))
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+/// What can be a `HashMap`'s key or a `HashSet`'s item.
+fn hashable(k: &Kind) -> bool {
+    matches!(k, Kind::Uuid | Kind::Str | Kind::I32 | Kind::I64 | Kind::Bool | Kind::Char)
+}
+
+/// A Java collection class as the Rust collection it becomes.
+fn collection(class: &str) -> Option<&'static str> {
+    Some(match class {
+        "java/util/List"
+        | "java/util/ArrayList"
+        | "java/util/LinkedList"
+        | "java/util/Collection"
+        | "java/util/concurrent/CopyOnWriteArrayList" => "Vec",
+        "java/util/Set"
+        | "java/util/HashSet"
+        | "java/util/LinkedHashSet"
+        | "java/util/concurrent/ConcurrentHashMap$KeySetView" => "HashSet",
+        "java/util/Map"
+        | "java/util/HashMap"
+        | "java/util/LinkedHashMap"
+        | "java/util/concurrent/ConcurrentHashMap"
+        | "java/util/concurrent/ConcurrentMap"
+        | "java/util/WeakHashMap" => "HashMap",
         _ => return None,
     })
+}
+
+/// A collection's item type (a class, boxed if a number) as a kind and Rust type.
+fn boxed_kind(class: &str) -> Option<(Kind, String)> {
+    let (k, t) = match class {
+        "java/lang/String" => (Kind::Str, "String"),
+        "java/lang/Integer" | "java/lang/Short" | "java/lang/Byte" => (Kind::I32, "i32"),
+        "java/lang/Long" => (Kind::I64, "i64"),
+        "java/lang/Double" => (Kind::F64, "f64"),
+        "java/lang/Float" => (Kind::F32, "f32"),
+        "java/lang/Boolean" => (Kind::Bool, "bool"),
+        "java/lang/Character" => (Kind::Char, "char"),
+        "java/util/UUID" => (Kind::Uuid, "Uuid"),
+        "org/bukkit/Location" => (Kind::Location, "Location"),
+        "org/bukkit/entity/Player" => (Kind::Player, "Player"),
+        _ => return None,
+    };
+    Some((k, t.to_owned()))
+}
+
+/// A generic signature's class and its type arguments' classes, one level deep:
+/// `Ljava/util/Map<Ljava/util/UUID;Ljava/lang/Long;>;` → (`java/util/Map`, [`java/util/UUID`,
+/// `java/lang/Long`]). `None` for nested generics and wildcards.
+fn generic(signature: &str) -> Option<(String, Vec<String>)> {
+    let inner = signature.strip_prefix('L')?.strip_suffix(';')?;
+    let Some(open) = inner.find('<') else { return Some((inner.to_owned(), Vec::new())) };
+    let class = inner[..open].to_owned();
+    let args = inner[open + 1..].strip_suffix('>')?;
+    let mut out = Vec::new();
+    for a in args.split_inclusive(';') {
+        let a = a.strip_prefix('L')?.strip_suffix(';')?;
+        if a.contains(['<', '>', '*', '+', '-']) {
+            return None;
+        }
+        out.push(a.to_owned());
+    }
+    Some((class, out))
 }
 
 /// The plugin's struct fields: the main class's fields of simple types, with the constants its
@@ -572,7 +683,7 @@ pub fn plugin_fields(main: &Class) -> BTreeMap<String, PluginField> {
     let mut out = BTreeMap::new();
     let mut taken = BTreeSet::new();
     for f in main.fields.iter().filter(|f| !f.is_static) {
-        let Some((kind, ty)) = field_kind(&f.descriptor) else { continue };
+        let Some((kind, ty)) = field_kind(&f.descriptor, f.signature.as_deref()) else { continue };
         let mut rust = snake(&f.name);
         while !taken.insert(rust.clone()) {
             rust.push('_');
@@ -750,7 +861,15 @@ impl<'a> Tr<'a> {
                     if target > end {
                         return Err("its branches don't nest (|| or a jump out)".into());
                     }
-                    let cond = self.then_condition(op, &mut stack)?;
+                    // `x == null` on an `Option` local: `if let Some(x) = x` or `let Some(x) = x else`.
+                    let opt = if matches!(op, 0xc6 | 0xc7) { self.opt_local(stack.last()) } else { None };
+                    let cond = match opt {
+                        Some(_) => {
+                            stack.pop();
+                            String::new()
+                        }
+                        None => self.then_condition(op, &mut stack)?,
+                    };
                     if !stack.is_empty() {
                         return Err("a value crosses a branch (a ?: expression)".into());
                     }
@@ -768,6 +887,11 @@ impl<'a> Tr<'a> {
                         }
                         _ => (target, None, target),
                     };
+                    if let Some((slot, inner)) = opt {
+                        self.null_check(op, slot, inner, (then_start, then_end), els, out)?;
+                        pc = next;
+                        continue;
+                    }
                     let mut then = Vec::new();
                     self.block(then_start, then_end, &mut then)?;
                     let mut els_stmts = Vec::new();
@@ -783,6 +907,7 @@ impl<'a> Tr<'a> {
                     let v = stack.pop().ok_or("return with an empty stack")?;
                     let v = match self.spec.ret {
                         Ret::Bool => self.boolean(&v)?,
+                        Ret::StrList if v.kind == Kind::Empty("Vec") => v.code,
                         Ret::StrList => {
                             if v.kind != Kind::StrList {
                                 return Err("it returns something other than a list of strings".into());
@@ -985,6 +1110,69 @@ impl<'a> Tr<'a> {
         Ok(finish)
     }
 
+    /// The slot and item kind of the `Option` local `top` reads, if it is one.
+    fn opt_local(&self, top: Option<&Expr>) -> Option<(u16, Kind)> {
+        let top = top?;
+        let Kind::Opt(inner) = &top.kind else { return None };
+        self.locals.iter().find(|(_, l)| l.name == top.code && l.kind == top.kind).map(|(s, _)| (*s, (**inner).clone()))
+    }
+
+    /// A `null` check on the `Option` local in `slot`: `ifnull` (0xc6) runs `then` when it has a
+    /// value, `ifnonnull` when it hasn't.
+    fn null_check(
+        &mut self,
+        op: u8,
+        slot: u16,
+        inner: Kind,
+        then: (usize, usize),
+        els: Option<(usize, usize)>,
+        out: &mut Vec<Stmt>,
+    ) -> R<()> {
+        let opt = self.locals[&slot].kind.clone();
+        let name = self.locals[&slot].name.clone();
+        let set = |tr: &mut Self, k: &Kind| tr.locals.get_mut(&slot).expect("the local").kind = k.clone();
+        let some = format!("let Some({name}) = {name}");
+        let mut then_stmts = Vec::new();
+        let mut els_stmts = Vec::new();
+        if op == 0xc6 {
+            set(self, &inner);
+            self.block(then.0, then.1, &mut then_stmts)?;
+            set(self, &opt);
+            if let Some((a, b)) = els {
+                self.block(a, b, &mut els_stmts)?;
+            }
+            out.push(Stmt::If { cond: some, then: then_stmts, els: els_stmts });
+            return Ok(());
+        }
+        self.block(then.0, then.1, &mut then_stmts)?;
+        match els {
+            // if (x == null) { ...; return; } and x has a value from here on.
+            None if diverges(&then_stmts) => {
+                // `let x = f(); let Some(x) = x else` → `let Some(x) = f() else`
+                let decl = format!("let {name} = ");
+                let value = match out.last() {
+                    Some(Stmt::Line(l)) if l.starts_with(&decl) && l.ends_with(';') => {
+                        Some(l[decl.len()..l.len() - 1].to_owned())
+                    }
+                    _ => None,
+                };
+                if value.is_some() {
+                    out.pop();
+                }
+                out.push(Stmt::LetElse { name, value, body: then_stmts });
+                set(self, &inner);
+            }
+            None => out.push(Stmt::If { cond: format!("{name}.is_none()"), then: then_stmts, els: Vec::new() }),
+            Some((a, b)) => {
+                set(self, &inner);
+                self.block(a, b, &mut els_stmts)?;
+                set(self, &opt);
+                out.push(Stmt::If { cond: some, then: els_stmts, els: then_stmts });
+            }
+        }
+        Ok(())
+    }
+
     fn pop(&self, stack: &mut Vec<Expr>) -> R<Expr> {
         stack.pop().ok_or_else(|| "the stack runs dry".into())
     }
@@ -1049,8 +1237,12 @@ impl<'a> Tr<'a> {
             }
             _ => {
                 let v = self.pop(stack)?;
-                let _ = v;
-                return Err("a null check".into());
+                if !matches!(v.kind, Kind::Opt(_)) {
+                    return Err("a null check".into());
+                }
+                let code = v.code.strip_suffix(".cloned()").unwrap_or(&v.code);
+                // ifnull jumps when it's null: the body runs when it has a value.
+                if op == 0xc6 { format!("{code}.is_some()") } else { format!("{code}.is_none()") }
             }
         })
     }
@@ -1153,6 +1345,7 @@ impl<'a> Tr<'a> {
 
     /// `e` converted to the Java parameter type `ty` (a descriptor letter or class).
     fn arg(&self, e: Expr, ty: &str) -> R<Expr> {
+        let e = deopt(e);
         Ok(match ty {
             "Z" => Expr::new(self.boolean(&e)?, Kind::Bool),
             "C" => self.cast(e, Kind::Char),
@@ -1164,15 +1357,21 @@ impl<'a> Tr<'a> {
         })
     }
 
-    fn local_name(&mut self, slot: u16, pc: usize) -> String {
-        // The variable whose scope starts right after this store; else any in this slot.
-        let mut in_slot: Vec<_> = self.body.locals.iter().filter(|l| l.slot == slot).collect();
+    /// The variable a store at `pc` into `slot` sets: the one whose scope starts right after it,
+    /// else any in this slot.
+    fn local_var(&self, slot: u16, pc: usize) -> Option<&'a classfile::LocalVar> {
+        let body: &'a Body = self.body;
+        let mut in_slot: Vec<_> = body.locals.iter().filter(|l| l.slot == slot).collect();
         in_slot.sort_by_key(|l| l.start);
-        let java = in_slot
+        in_slot
             .iter()
             .find(|l| l.start as usize > pc)
             .or_else(|| in_slot.iter().rev().find(|l| l.start as usize <= pc))
-            .map(|l| l.name.clone());
+            .copied()
+    }
+
+    fn local_name(&mut self, slot: u16, pc: usize) -> String {
+        let java = self.local_var(slot, pc).map(|l| l.name.clone());
         let mut name = java.map(|n| snake(&n)).unwrap_or_else(|| format!("v{slot}"));
         while self.names.contains(&name) {
             name.push('_');
@@ -1197,6 +1396,27 @@ impl<'a> Tr<'a> {
     fn store(&mut self, slot: u16, pc: usize, v: Expr, out: &mut Vec<Stmt>) -> R<()> {
         if self.params.contains_key(&slot) {
             return Err("it assigns to a parameter".into());
+        }
+        if let Kind::Empty(family) = v.kind {
+            if self.locals.contains_key(&slot) {
+                return Err("a collection local set twice".into());
+            }
+            let typed = self
+                .local_var(slot, pc)
+                .and_then(|l| field_kind(&l.descriptor, l.signature.as_deref()))
+                .filter(|(_, ty)| ty.starts_with(family));
+            let (kind, ty) = match typed {
+                Some(t) => t,
+                None if family == "Vec" => (Kind::StrList, "Vec<String>".to_owned()),
+                None => return Err(format!("a {family} of unknown types")),
+            };
+            let name = self.local_name(slot, pc);
+            out.push(Stmt::Line(format!("let mut {name}: {ty} = {};", v.code)));
+            self.locals.insert(slot, Local { name, kind });
+            return Ok(());
+        }
+        if v.place && matches!(v.kind, Kind::StrList | Kind::List(_) | Kind::Map(..) | Kind::Set(_)) {
+            return Err("a local naming a collection".into());
         }
         if matches!(
             v.kind,
@@ -1396,9 +1616,16 @@ impl<'a> Tr<'a> {
                     }
                     _ => return Err("setting a field of something other than the plugin".into()),
                 };
-                let v = match f.kind {
+                let v = match &f.kind {
                     Kind::Bool => self.boolean(&v)?,
                     Kind::Str => self.s_owned(&v)?,
+                    Kind::StrList | Kind::List(_) | Kind::Map(..) | Kind::Set(_) => match &v.kind {
+                        Kind::Empty(family) if f.ty.starts_with(family) => v.code.clone(),
+                        k if k == &f.kind && v.place => format!("{}.clone()", v.recv()),
+                        k if k == &f.kind => v.code.clone(),
+                        k => return Err(format!("setting a {} to {k:?}", f.ty)),
+                    },
+                    Kind::Uuid | Kind::Location | Kind::Player => self.owned(&v, &f.kind)?,
                     _ => self.cast(v, f.kind.clone()).code,
                 };
                 // `x = x + 1` → `x += 1`
@@ -1568,14 +1795,19 @@ impl<'a> Tr<'a> {
 
     fn method(&mut self, m: &MemberRef, r: Expr, a: &[Expr]) -> R<Expr> {
         let n = m.name.as_str();
-        let rc = r.recv();
         let none = || Err(format!("{}.{} has no Rust form here", mapping::simple_name(&m.owner), n));
         let stmt = |code: String| -> R<Expr> { Ok(Expr::new(code, Kind::Ignored)) };
+        // What may be null is used as if it weren't: Java would throw, Rust panics.
+        let r = deopt(r);
+        let rc = r.recv();
         // Boxing and unboxing are the value itself.
-        if matches!(n, "intValue" | "longValue" | "doubleValue" | "floatValue" | "booleanValue")
+        if matches!(n, "intValue" | "longValue" | "doubleValue" | "floatValue" | "booleanValue" | "charValue")
             && m.owner.starts_with("java/lang/")
         {
             return Ok(r);
+        }
+        if let Some(e) = self.collection_call(m, &r, a)? {
+            return Ok(e);
         }
         Ok(match (&r.kind, n, a.len()) {
             // Players.
@@ -1619,18 +1851,14 @@ impl<'a> Tr<'a> {
                 stmt(format!("{rc}.send_title({}, {}, 10, 70, 20)", self.s_ref(&a[0])?, self.s_ref(&a[1])?))?
             }
             // Lists and their for-each loops.
-            (Kind::PlayerList | Kind::StrList, "iterator", 0) => {
-                let item = if r.kind == Kind::PlayerList { Kind::Player } else { Kind::Str };
+            (Kind::PlayerList, "iterator", 0) => {
                 let iter = if r.code.contains('(') { r.code.clone() } else { format!("{rc}.clone()") };
-                Expr::new("", Kind::Iter(iter, Box::new(item)))
+                Expr::new("", Kind::Iter(iter, Box::new(Kind::Player)))
             }
             (Kind::Iter(iter, item), "hasNext", 0) => Expr::new("", Kind::HasNext(iter.clone(), item.clone())),
             (Kind::Iter(_, item), "next", 0) => Expr::new("", Kind::LoopItem(item.clone())),
-            (Kind::PlayerList | Kind::StrList, "size", 0) => Expr::op(format!("{rc}.len() as i32"), Kind::I32),
-            (Kind::PlayerList | Kind::StrList, "isEmpty", 0) => Expr::new(format!("{rc}.is_empty()"), Kind::Bool),
-            (Kind::StrList, "contains", 1) if matches!(a[0].kind, Kind::Str | Kind::StrRef) => {
-                Expr::new(format!("{rc}.iter().any(|s| s == {})", self.s_ref(&a[0])?), Kind::Bool)
-            }
+            (Kind::PlayerList, "size", 0) => Expr::op(format!("{rc}.len() as i32"), Kind::I32),
+            (Kind::PlayerList, "isEmpty", 0) => Expr::new(format!("{rc}.is_empty()"), Kind::Bool),
             (Kind::Str | Kind::StrRef, "hashCode", 0) => Expr::new("", Kind::Hash(Box::new(r.clone()))),
             (Kind::World, "getPlayers", 0) => Expr::new(format!("{rc}.players()"), Kind::PlayerList),
             // Command senders.
@@ -1718,6 +1946,112 @@ impl<'a> Tr<'a> {
         })
     }
 
+    /// `e` as the key to look `k` up by: `&uuid`, `name`.
+    fn key_ref(&self, e: &Expr, k: &Kind) -> R<String> {
+        match k {
+            Kind::Str => self.s_ref(e),
+            _ => Ok(format!("&{}", self.owned_atom(e, k)?)),
+        }
+    }
+
+    fn owned_atom(&self, e: &Expr, k: &Kind) -> R<String> {
+        let code = self.owned(e, k)?;
+        let simple = code.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.');
+        Ok(if simple || e.atom && code == e.code { code } else { format!("({code})") })
+    }
+
+    /// `e` as an owned `k`, to keep in a collection or a field.
+    fn owned(&self, e: &Expr, k: &Kind) -> R<String> {
+        let number = |k: &Kind| matches!(k, Kind::I32 | Kind::I64 | Kind::F32 | Kind::F64 | Kind::Char);
+        match k {
+            Kind::Str => self.s_owned(e),
+            Kind::Bool => self.boolean(e),
+            _ if number(k) && number(&e.kind) => Ok(self.cast(e.clone(), k.clone()).code),
+            Kind::Uuid if e.kind == Kind::Uuid => Ok(e.code.clone()),
+            Kind::Location | Kind::Player if e.kind == *k && e.place => Ok(format!("{}.clone()", e.recv())),
+            Kind::Location | Kind::Player if e.kind == *k => Ok(e.code.clone()),
+            _ => Err(format!("{:?} where a {k:?} goes", e.kind)),
+        }
+    }
+
+    /// Calls on maps, sets and lists; `None` when `r` isn't one.
+    fn collection_call(&self, m: &MemberRef, r: &Expr, a: &[Expr]) -> R<Option<Expr>> {
+        let n = m.name.as_str();
+        let rc = r.recv();
+        let list = |k: &Kind| if *k == Kind::Str { Kind::StrList } else { Kind::List(Box::new(k.clone())) };
+        let stmt = |code: String| Expr::new(code, Kind::Ignored);
+        let common = |item: Option<&Kind>| -> Option<Expr> {
+            Some(match (n, a.len()) {
+                ("size", 0) => Expr::op(format!("{rc}.len() as i32"), Kind::I32),
+                ("isEmpty", 0) => Expr::new(format!("{rc}.is_empty()"), Kind::Bool),
+                ("clear", 0) => stmt(format!("{rc}.clear()")),
+                ("iterator", 0) => {
+                    let iter = if r.code.contains('(') { r.code.clone() } else { format!("{rc}.clone()") };
+                    Expr::new("", Kind::Iter(iter, Box::new(item?.clone())))
+                }
+                _ => return None,
+            })
+        };
+        Ok(Some(match &r.kind {
+            Kind::Map(k, v) => match (n, a.len()) {
+                ("put", 2) => Expr::new(
+                    format!("{rc}.insert({}, {})", self.owned(&a[0], k)?, self.owned(&a[1], v)?),
+                    Kind::Opt(v.clone()),
+                ),
+                ("putIfAbsent", 2) => {
+                    stmt(format!("{rc}.entry({}).or_insert({})", self.owned(&a[0], k)?, self.owned(&a[1], v)?))
+                }
+                ("get", 1) => {
+                    Expr::new(format!("{rc}.get({}).cloned()", self.key_ref(&a[0], k)?), Kind::Opt(v.clone()))
+                }
+                ("getOrDefault", 2) => Expr::new(
+                    format!("{rc}.get({}).cloned().unwrap_or({})", self.key_ref(&a[0], k)?, self.owned(&a[1], v)?),
+                    (**v).clone(),
+                ),
+                ("containsKey", 1) => Expr::new(format!("{rc}.contains_key({})", self.key_ref(&a[0], k)?), Kind::Bool),
+                ("remove", 1) => Expr::new(format!("{rc}.remove({})", self.key_ref(&a[0], k)?), Kind::Opt(v.clone())),
+                ("keySet", 0) => Expr::new(format!("{rc}.keys().cloned().collect::<Vec<_>>()"), list(k)),
+                ("values", 0) => Expr::new(format!("{rc}.values().cloned().collect::<Vec<_>>()"), list(v)),
+                _ => return common(None).map(Some).ok_or_else(|| format!("Map.{n} has no Rust form here")),
+            },
+            Kind::Set(k) => match (n, a.len()) {
+                ("add", 1) => Expr::new(format!("{rc}.insert({})", self.owned(&a[0], k)?), Kind::Bool),
+                ("remove", 1) => Expr::new(format!("{rc}.remove({})", self.key_ref(&a[0], k)?), Kind::Bool),
+                ("contains", 1) => Expr::new(format!("{rc}.contains({})", self.key_ref(&a[0], k)?), Kind::Bool),
+                _ => return common(Some(k)).map(Some).ok_or_else(|| format!("Set.{n} has no Rust form here")),
+            },
+            Kind::StrList | Kind::List(_) => {
+                let k = match &r.kind {
+                    Kind::List(k) => (**k).clone(),
+                    _ => Kind::Str,
+                };
+                let index = |e: &Expr| match e.lit {
+                    Some(Lit::Int(v)) => v.to_string(),
+                    _ => format!("{} as usize", e.recv()),
+                };
+                let by_index = classfile::parameters(&m.descriptor).first().is_some_and(|t| t == "I");
+                match (n, a.len()) {
+                    ("add", 1) => stmt(format!("{rc}.push({})", self.owned(&a[0], &k)?)),
+                    ("add", 2) if by_index => {
+                        stmt(format!("{rc}.insert({}, {})", index(&a[0]), self.owned(&a[1], &k)?))
+                    }
+                    ("get", 1) => Expr::place(format!("{rc}[{}]", index(&a[0])), k),
+                    ("remove", 1) if by_index => Expr::new(format!("{rc}.remove({})", index(&a[0])), k),
+                    ("remove", 1) => stmt(format!("{rc}.retain(|x| x != {})", self.key_ref(&a[0], &k)?)),
+                    ("contains", 1) if k == Kind::Str => {
+                        Expr::new(format!("{rc}.iter().any(|s| s == {})", self.s_ref(&a[0])?), Kind::Bool)
+                    }
+                    ("contains", 1) => Expr::new(format!("{rc}.contains({})", self.key_ref(&a[0], &k)?), Kind::Bool),
+                    _ => match common(Some(&k)) {
+                        Some(e) => e,
+                        None => return Ok(None),
+                    },
+                }
+            }
+            _ => return Ok(None),
+        }))
+    }
+
     fn event_method(&self, ev: &'static str, rc: &str, n: &str, a: &[Expr]) -> R<Expr> {
         let field = |name: &str| -> R<Expr> {
             let kind = event_field(ev, name).ok_or_else(|| format!("{ev} has no {name}"))?;
@@ -1771,6 +2105,16 @@ impl<'a> Tr<'a> {
                 Ok(Expr::new(format!("server().dispatch_command({})", self.s_ref(&a[1])?), Kind::Bool))
             }
             ("getConsoleSender", 0) => Ok(Expr::new("server().console_sender()", Kind::Sender)),
+            ("getPlayer", 1) if a[0].kind == Kind::Uuid => {
+                Ok(Expr::new(format!("server().player_by_uuid({})", a[0].code), Kind::Opt(Box::new(Kind::Player))))
+            }
+            ("getPlayer", 1) => Ok(Expr::new(
+                format!("server().match_player({})", self.s_ref(&a[0])?),
+                Kind::Opt(Box::new(Kind::Player)),
+            )),
+            ("getPlayerExact", 1) => {
+                Ok(Expr::new(format!("server().player({})", self.s_ref(&a[0])?), Kind::Opt(Box::new(Kind::Player))))
+            }
             ("getOnlinePlayers", 0) => Ok(Expr::new("server().online_players()", Kind::PlayerList)),
             ("getServer", 0) => Ok(Expr::new("server()", Kind::Server)),
             ("getLogger", 0) => Ok(Expr::new("ctx.logger()", Kind::Logger)),
@@ -1969,9 +2313,27 @@ fn static_field(m: &MemberRef) -> R<Expr> {
     })
 }
 
+/// Whether a value of kind `k` is an instance of the Java class `simple`.
+fn is_a(k: &Kind, simple: &str) -> bool {
+    matches!(
+        (k, simple),
+        (Kind::Str | Kind::StrRef, "String" | "CharSequence" | "Object")
+            | (Kind::Player, "Player" | "Object")
+            | (Kind::Uuid, "UUID" | "Object")
+            | (Kind::Location, "Location" | "Object")
+            | (Kind::I32, "Integer" | "Number" | "Object")
+            | (Kind::I64, "Long" | "Number" | "Object")
+            | (Kind::F64, "Double" | "Number" | "Object")
+            | (Kind::F32, "Float" | "Number" | "Object")
+            | (Kind::Bool, "Boolean" | "Object")
+            | (Kind::Char, "Character" | "Object")
+    )
+}
+
 fn checkcast(v: Expr, class: &str) -> R<Expr> {
     let simple = mapping::simple_name(class);
     match (&v.kind, simple) {
+        (Kind::Opt(k) | Kind::LoopItem(k), _) if is_a(k, simple) => Ok(v),
         (Kind::Sender, "Player") => Ok(Expr::new(format!("{}.player().expect(\"a player\")", v.recv()), Kind::Player)),
         (Kind::Str | Kind::StrRef, "String" | "CharSequence") => Ok(v),
         (Kind::Player, "Player") | (Kind::Sender, "CommandSender") => Ok(v),
@@ -1983,6 +2345,36 @@ fn checkcast(v: Expr, class: &str) -> R<Expr> {
             "Integer" | "Long" | "Double" | "Float" | "Boolean" | "Number",
         ) => Ok(v),
         _ => Err(format!("a cast of {:?} to {simple}", v.kind)),
+    }
+}
+
+/// What may be `null` (an `Option`) as the value, where Java code uses it as one: `m[&k]` for a
+/// map's `get`, else `unwrap()`.
+fn deopt(e: Expr) -> Expr {
+    let Kind::Opt(k) = &e.kind else { return e };
+    let k = (**k).clone();
+    if let Some(head) = e.code.strip_suffix(").cloned()") {
+        // The `(` that opens the last call.
+        let mut depth = 0;
+        for (i, c) in head.char_indices().rev() {
+            match c {
+                ')' => depth += 1,
+                '(' if depth > 0 => depth -= 1,
+                '(' => {
+                    if let Some(map) = head[..i].strip_suffix(".get") {
+                        return Expr::place(format!("{map}[{}]", &head[i + 1..]), k);
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    let copy = matches!(k, Kind::Uuid | Kind::I32 | Kind::I64 | Kind::F32 | Kind::F64 | Kind::Bool | Kind::Char);
+    if copy {
+        Expr::new(format!("{}.unwrap()", e.recv()), k)
+    } else {
+        Expr::place(format!("{}.as_ref().unwrap()", e.recv()), k)
     }
 }
 
@@ -2014,6 +2406,23 @@ fn construct(m: &MemberRef, recv: Expr, a: Vec<Expr>, tr: &Tr) -> R<Expr> {
             Kind::Location,
         )),
         ("String", 1) if matches!(a[0].kind, Kind::Str | Kind::StrRef) => Ok(Expr::new(tr.s_owned(&a[0])?, Kind::Str)),
+        (s, n) if collection(c).is_some() && (n == 0 || (n == 1 && matches!(a[0].kind, Kind::I32))) => {
+            let family = collection(c).unwrap_or_default();
+            let _ = s;
+            Ok(Expr::new(format!("{family}::new()"), Kind::Empty(family)))
+        }
+        (_, 1) if collection(c) == Some("Vec") => match &a[0].kind {
+            Kind::Args => Ok(Expr::new(format!("{}.to_vec()", a[0].recv()), Kind::StrList)),
+            Kind::StrList | Kind::List(_) if a[0].place => {
+                Ok(Expr::new(format!("{}.clone()", a[0].recv()), a[0].kind.clone()))
+            }
+            Kind::StrList | Kind::List(_) => Ok(a[0].clone()),
+            Kind::Set(k) => Ok(Expr::new(
+                format!("{}.iter().cloned().collect::<Vec<_>>()", a[0].recv()),
+                if **k == Kind::Str { Kind::StrList } else { Kind::List(k.clone()) },
+            )),
+            k => Err(format!("a list from {k:?}")),
+        },
         (s, _) => Err(format!("new {s}")),
     }
 }

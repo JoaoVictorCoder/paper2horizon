@@ -1,0 +1,1 @@
+package org.bukkit.event.player; public class PlayerMoveEvent extends PlayerEvent implements org.bukkit.event.Cancellable { public boolean isCancelled() { return false; } public void setCancelled(boolean c) {} }

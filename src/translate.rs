@@ -263,6 +263,8 @@ pub struct PluginField {
     pub rust: String,
     pub kind: Kind,
     pub ty: String,
+    /// Its Java name: `joins`, or `HungerListener.lastFoodLevels` for another class's.
+    pub java: String,
     /// Its value at construction, when the Java constructor sets a constant.
     pub init: Option<String>,
 }
@@ -589,6 +591,11 @@ pub fn field_kind(descriptor: &str, signature: Option<&str>) -> Option<(Kind, St
         "Z" => simple(Kind::Bool, "bool"),
         "C" => simple(Kind::Char, "char"),
         "Ljava/lang/String;" => simple(Kind::Str, "String"),
+        // What starts as `null`.
+        "Ljava/util/UUID;" | "Lorg/bukkit/Location;" | "Lorg/bukkit/entity/Player;" => {
+            let (k, t) = boxed_kind(descriptor.strip_prefix('L')?.strip_suffix(';')?)?;
+            Some((Kind::Opt(Box::new(k)), format!("Option<{t}>")))
+        }
         _ => {
             let (class, args) = generic(signature?)?;
             let item = |i: usize| args.get(i).and_then(|a| boxed_kind(a));
@@ -677,69 +684,109 @@ fn generic(signature: &str) -> Option<(String, Vec<String>)> {
     Some((class, out))
 }
 
-/// The plugin's struct fields: the main class's fields of simple types, with the constants its
-/// constructor sets them to.
-pub fn plugin_fields(main: &Class) -> BTreeMap<String, PluginField> {
+/// The plugin's struct fields, keyed `owner.name`: the main class's fields of simple types and
+/// collections, the instance fields of the classes registered as listeners and commands (one each, so
+/// their state is the plugin's), and the static fields of the plugin's own classes that are read
+/// outside their class initializer. Each with the constant its constructor or class initializer sets.
+pub fn plugin_fields(main: &Class, own: &[&Class], registered: &BTreeSet<&str>) -> BTreeMap<String, PluginField> {
     let mut out = BTreeMap::new();
     let mut taken = BTreeSet::new();
-    for f in main.fields.iter().filter(|f| !f.is_static) {
-        let Some((kind, ty)) = field_kind(&f.descriptor, f.signature.as_deref()) else { continue };
-        let mut rust = snake(&f.name);
-        while !taken.insert(rust.clone()) {
-            rust.push('_');
+    // Static fields read somewhere: the others are constants javac already inlined, or unused.
+    let mut read = BTreeSet::new();
+    for c in own {
+        for m in c.methods.iter().filter(|m| m.name != "<clinit>") {
+            let Some(body) = &m.body else { continue };
+            let mut pc = 0;
+            while pc < body.code.len() {
+                let Some(n) = classfile::instruction_len(&body.code, pc) else { break };
+                if matches!(body.code[pc], 0xb2 | 0xb4) {
+                    if let Some(r) = c.member(u16::from_be_bytes([body.code[pc + 1], body.code[pc + 2]])) {
+                        read.insert(format!("{}.{}", r.owner, r.name));
+                    }
+                }
+                pc += n;
+            }
         }
-        out.insert(f.name.clone(), PluginField { rust, kind, ty, init: None });
     }
-    // `this.x = <constant>` in the constructor.
-    if let Some(body) = main.method("<init>").and_then(|m| m.body.as_ref()) {
-        let code = &body.code;
-        let mut pc = 0;
-        let mut last: Option<String> = None;
-        while pc < code.len() {
-            let Some(n) = classfile::instruction_len(code, pc) else { break };
-            let op = code[pc];
-            let u16_at = |p: usize| u16::from_be_bytes([code[p + 1], code[p + 2]]);
-            last = match op {
-                0x02..=0x08 => Some((op as i64 - 3).to_string()),
-                0x09 | 0x0a => Some((op as i64 - 9).to_string()),
-                0x0b..=0x0d => Some(format!("{:?}", (op - 0x0b) as f32)),
-                0x0e | 0x0f => Some(format!("{:?}", (op - 0x0e) as f64)),
-                0x10 => Some((code[pc + 1] as i8).to_string()),
-                0x11 => Some((u16_at(pc) as i16).to_string()),
-                0x12..=0x14 => {
-                    let i = if op == 0x12 { code[pc + 1] as u16 } else { u16_at(pc) };
-                    match main.constant(i) {
-                        Some(Const::Int(v)) => Some(v.to_string()),
-                        Some(Const::Long(v)) => Some(v.to_string()),
-                        Some(Const::Float(v)) => Some(format!("{v:?}")),
-                        Some(Const::Double(v)) => Some(format!("{v:?}")),
-                        Some(Const::Str(s)) => Some(format!("{s:?}.to_owned()")),
-                        _ => None,
-                    }
-                }
-                0xb5 => {
-                    if let (Some(v), Some(m)) = (last.take(), main.member(u16_at(pc))) {
-                        if m.owner == main.name {
-                            if let Some(f) = out.get_mut(&m.name) {
-                                f.init = Some(match (&f.kind, v.as_str()) {
-                                    (Kind::Bool, "0") => "false".into(),
-                                    (Kind::Bool, "1") => "true".into(),
-                                    (Kind::Char, c) => c
-                                        .parse::<u32>()
-                                        .ok()
-                                        .and_then(char::from_u32)
-                                        .map_or(v.clone(), |c| format!("{c:?}")),
-                                    _ => v,
-                                });
-                            }
-                        }
-                    }
-                    None
-                }
-                _ => None,
-            };
-            pc += n;
+    let classes = std::iter::once(main).chain(own.iter().copied().filter(|c| c.name != main.name));
+    for c in classes {
+        let is_main = c.name == main.name;
+        for f in &c.fields {
+            let key = format!("{}.{}", c.name, f.name);
+            let wanted =
+                if f.is_static { read.contains(&key) } else { is_main || registered.contains(c.name.as_str()) };
+            if !wanted {
+                continue;
+            }
+            let Some((kind, ty)) = field_kind(&f.descriptor, f.signature.as_deref()) else { continue };
+            let mut rust = snake(&f.name);
+            if !is_main && taken.contains(&rust) {
+                rust = format!("{}_{rust}", snake(mapping::simple_name(&c.name)));
+            }
+            while !taken.insert(rust.clone()) {
+                rust.push('_');
+            }
+            let java = if is_main { f.name.clone() } else { format!("{}.{}", mapping::simple_name(&c.name), f.name) };
+            out.insert(key, PluginField { rust, kind, ty, init: None, java });
         }
+        for (method, put) in [("<init>", 0xb5), ("<clinit>", 0xb3)] {
+            for (name, v) in constant_stores(c, method, put) {
+                let Some(f) = out.get_mut(&format!("{}.{name}", c.name)) else { continue };
+                f.init = Some(match (&f.kind, v.as_str()) {
+                    (Kind::Bool, "0") => "false".into(),
+                    (Kind::Bool, "1") => "true".into(),
+                    (Kind::Char, c) => {
+                        c.parse::<u32>().ok().and_then(char::from_u32).map_or(v.clone(), |c| format!("{c:?}"))
+                    }
+                    _ => v,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The constants `method` of `class` stores into the class's own fields with `put` (putfield or
+/// putstatic): `this.x = <constant>`.
+fn constant_stores(class: &Class, method: &str, put: u8) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Some(body) = class.method(method).and_then(|m| m.body.as_ref()) else { return out };
+    let code = &body.code;
+    let mut pc = 0;
+    let mut last: Option<String> = None;
+    while pc < code.len() {
+        let Some(n) = classfile::instruction_len(code, pc) else { break };
+        let op = code[pc];
+        let u16_at = |p: usize| u16::from_be_bytes([code[p + 1], code[p + 2]]);
+        last = match op {
+            0x02..=0x08 => Some((op as i64 - 3).to_string()),
+            0x09 | 0x0a => Some((op as i64 - 9).to_string()),
+            0x0b..=0x0d => Some(format!("{:?}", (op - 0x0b) as f32)),
+            0x0e | 0x0f => Some(format!("{:?}", (op - 0x0e) as f64)),
+            0x10 => Some((code[pc + 1] as i8).to_string()),
+            0x11 => Some((u16_at(pc) as i16).to_string()),
+            0x12..=0x14 => {
+                let i = if op == 0x12 { code[pc + 1] as u16 } else { u16_at(pc) };
+                match class.constant(i) {
+                    Some(Const::Int(v)) => Some(v.to_string()),
+                    Some(Const::Long(v)) => Some(v.to_string()),
+                    Some(Const::Float(v)) => Some(format!("{v:?}")),
+                    Some(Const::Double(v)) => Some(format!("{v:?}")),
+                    Some(Const::Str(s)) => Some(format!("{s:?}.to_owned()")),
+                    _ => None,
+                }
+            }
+            _ if op == put => {
+                if let (Some(v), Some(m)) = (last.take(), class.member(u16_at(pc))) {
+                    if m.owner == class.name {
+                        out.push((m.name, v));
+                    }
+                }
+                None
+            }
+            _ => None,
+        };
+        pc += n;
     }
     out
 }
@@ -1462,7 +1509,7 @@ impl<'a> Tr<'a> {
         }
         let value = match v.kind {
             Kind::Str if v.place => format!("{}.clone()", v.recv()),
-            Kind::Player | Kind::Location | Kind::Block | Kind::BlockPos | Kind::World if v.place => {
+            Kind::Player | Kind::Location | Kind::Block | Kind::BlockPos | Kind::World | Kind::Opt(_) if v.place => {
                 format!("{}.clone()", v.recv())
             }
             _ => v.code.clone(),
@@ -1599,7 +1646,23 @@ impl<'a> Tr<'a> {
             }
             0xb2 => {
                 let m = self.spec.class.member(self.u16_at(pc)).ok_or("a bad field reference")?;
-                stack.push(static_field(&m)?);
+                if let Some(f) = self.spec.fields.get(&format!("{}.{}", m.owner, m.name)) {
+                    stack.push(Expr::place(format!("plugin.{}", f.rust), f.kind.clone()));
+                } else if m.descriptor == format!("L{};", self.spec.main) {
+                    // The plugin's singleton (`Main.instance`).
+                    stack.push(Expr::new("plugin", Kind::Plugin));
+                } else {
+                    stack.push(static_field(&m)?);
+                }
+            }
+            0xb3 => {
+                let m = self.spec.class.member(self.u16_at(pc)).ok_or("a bad field reference")?;
+                let v = self.pop(stack)?;
+                let f =
+                    self.spec.fields.get(&format!("{}.{}", m.owner, m.name)).ok_or_else(|| {
+                        format!("setting the static field {}.{}", mapping::simple_name(&m.owner), m.name)
+                    })?;
+                self.set_field(f, v, out)?;
             }
             0xb4 => {
                 let m = self.spec.class.member(self.u16_at(pc)).ok_or("a bad field reference")?;
@@ -1611,32 +1674,14 @@ impl<'a> Tr<'a> {
                 let v = self.pop(stack)?;
                 let obj = self.pop(stack)?;
                 let f = match obj.kind {
-                    Kind::Plugin if m.owner == self.spec.main => {
-                        self.spec.fields.get(&m.name).ok_or("a field of the plugin with no Rust type")?
-                    }
+                    Kind::Plugin | Kind::Listener => self
+                        .spec
+                        .fields
+                        .get(&format!("{}.{}", m.owner, m.name))
+                        .ok_or("a field of the plugin with no Rust type")?,
                     _ => return Err("setting a field of something other than the plugin".into()),
                 };
-                let v = match &f.kind {
-                    Kind::Bool => self.boolean(&v)?,
-                    Kind::Str => self.s_owned(&v)?,
-                    Kind::StrList | Kind::List(_) | Kind::Map(..) | Kind::Set(_) => match &v.kind {
-                        Kind::Empty(family) if f.ty.starts_with(family) => v.code.clone(),
-                        k if k == &f.kind && v.place => format!("{}.clone()", v.recv()),
-                        k if k == &f.kind => v.code.clone(),
-                        k => return Err(format!("setting a {} to {k:?}", f.ty)),
-                    },
-                    Kind::Uuid | Kind::Location | Kind::Player => self.owned(&v, &f.kind)?,
-                    _ => self.cast(v, f.kind.clone()).code,
-                };
-                // `x = x + 1` → `x += 1`
-                let field = format!("plugin.{}", f.rust);
-                let line = [" + ", " - ", " * "]
-                    .iter()
-                    .find_map(|op| {
-                        v.strip_prefix(&format!("{field}{op}")).map(|rest| format!("{field} {}= {rest};", op.trim()))
-                    })
-                    .unwrap_or_else(|| format!("{field} = {v};"));
-                out.push(Stmt::Line(line));
+                self.set_field(f, v, out)?;
             }
             0xb6..=0xb9 => {
                 let m = self.spec.class.member(self.u16_at(pc)).ok_or("a bad method reference")?;
@@ -1723,12 +1768,45 @@ impl<'a> Tr<'a> {
         Ok(())
     }
 
+    /// `plugin.field = v;`, as `+=` where it can.
+    fn set_field(&self, f: &PluginField, v: Expr, out: &mut Vec<Stmt>) -> R<()> {
+        let v = match &f.kind {
+            Kind::Bool => self.boolean(&v)?,
+            Kind::Str => self.s_owned(&v)?,
+            Kind::StrList | Kind::List(_) | Kind::Map(..) | Kind::Set(_) => match &v.kind {
+                Kind::Empty(family) if f.ty.starts_with(family) => v.code.clone(),
+                k if k == &f.kind && v.place => format!("{}.clone()", v.recv()),
+                k if k == &f.kind => v.code.clone(),
+                k => return Err(format!("setting a {} to {k:?}", f.ty)),
+            },
+            Kind::Opt(inner) => match &v.kind {
+                Kind::Null => "None".to_owned(),
+                k if k == &f.kind && v.place => format!("{}.clone()", v.recv()),
+                k if k == &f.kind => v.code.clone(),
+                _ => format!("Some({})", self.owned(&v, inner)?),
+            },
+            _ => self.cast(v, f.kind.clone()).code,
+        };
+        // `x = x + 1` → `x += 1`
+        let field = format!("plugin.{}", f.rust);
+        let line = [" + ", " - ", " * "]
+            .iter()
+            .find_map(|op| {
+                v.strip_prefix(&format!("{field}{op}")).map(|rest| format!("{field} {}= {rest};", op.trim()))
+            })
+            .unwrap_or_else(|| format!("{field} = {v};"));
+        out.push(Stmt::Line(line));
+        Ok(())
+    }
+
     fn get_field(&self, obj: &Expr, m: &MemberRef) -> R<Expr> {
+        let own = self.spec.fields.get(&format!("{}.{}", m.owner, m.name));
         match obj.kind {
-            Kind::Plugin if m.owner == self.spec.main => {
-                let f = self.spec.fields.get(&m.name).ok_or("a field of the plugin with no Rust type")?;
+            Kind::Plugin | Kind::Listener if own.is_some() => {
+                let f = own.expect("checked");
                 Ok(Expr::place(format!("plugin.{}", f.rust), f.kind.clone()))
             }
+            Kind::Plugin if m.owner == self.spec.main => Err("a field of the plugin with no Rust type".into()),
             // A listener's reference to the plugin.
             Kind::Listener if m.descriptor == format!("L{};", self.spec.main) => Ok(Expr::new("plugin", Kind::Plugin)),
             _ => Err(format!("reading the field {}.{}", mapping::simple_name(&m.owner), m.name)),
@@ -1768,6 +1846,10 @@ impl<'a> Tr<'a> {
         let Some(helpers) = self.spec.helpers else { return Ok(None) };
         if !own_receiver || m.name.starts_with('<') || m.name.starts_with("lambda$") {
             return Ok(None);
+        }
+        // `Main.getInstance()`: the plugin's singleton.
+        if m.descriptor == format!("()L{};", self.spec.main) {
+            return Ok(Some(Expr::new("plugin", Kind::Plugin)));
         }
         // Only the plugin's own classes have helpers; the API's methods on the plugin (getConfig) don't.
         let helper = match helpers(m) {

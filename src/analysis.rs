@@ -589,7 +589,17 @@ pub fn analyze(jar: Jar) -> Result<Analysis, String> {
     }
 
     let (on_enable, on_disable, on_load) = (lifecycle("onEnable"), lifecycle("onDisable"), lifecycle("onLoad"));
-    let fields = index.classes.get(main.as_str()).map(|c| crate::translate::plugin_fields(c)).unwrap_or_default();
+    let registered: BTreeSet<&str> = listeners
+        .iter()
+        .map(|l: &Listener| l.class.as_str())
+        .chain(commands.iter().flat_map(|c| [&c.executor, &c.completer]).flatten().map(|(c, _)| c.as_str()))
+        .collect();
+    let own_classes: Vec<&Class> = jar.classes.iter().filter(|c| own(&c.name)).collect();
+    let fields = index
+        .classes
+        .get(main.as_str())
+        .map(|c| crate::translate::plugin_fields(c, &own_classes, &registered))
+        .unwrap_or_default();
     Ok(Analysis {
         on_enable,
         on_disable,

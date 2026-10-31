@@ -72,9 +72,10 @@ if let Some(last) = last {
 
 Read translated code over: Java's `null` and Rust's defaults differ (`getConfig().getString(path)` is `""` here when
 the key is missing, not `null`), and a value Java reads without a check (`map.get(k).longValue()`) is `map[&k]`, which
-panics where Java would throw (the plugin's runtime catches and logs both). On 66 small plugins from Modrinth, 23 of
-277 bodies translate today, and every crate compiles; most of the rest keep their state in the fields of other classes
-(a listener's own map, a static singleton), which is next (TODO.md).
+panics where Java would throw (the plugin's runtime catches and logs both). A listener's or a command's own fields,
+and the static fields of the plugin's classes, are fields of the plugin's struct too; `Main.getInstance()` is `plugin`.
+On 66 small plugins from Modrinth, 26 of 277 bodies translate today, and every crate compiles; much of the rest keeps
+its state in objects of the plugin's own classes (a `SeatManager`, a `FileManager`), which is next (TODO.md).
 
 ## Use
 

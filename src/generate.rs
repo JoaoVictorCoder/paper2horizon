@@ -631,7 +631,9 @@ impl Gen<'_> {
     fn plugin_struct(&mut self, name: &str) {
         let a = self.a;
         self.line(&format!("/// The plugin (Java: {}).", java_name(&a.main)));
-        let fields: Vec<_> = a.fields.iter().collect();
+        let mut fields: Vec<_> = a.fields.iter().collect();
+        // The main class's first, then the other classes'.
+        fields.sort_by_key(|(_, f)| f.java.contains('.'));
         let custom = fields.iter().any(|(_, f)| f.init.is_some());
         if !custom {
             self.line("#[derive(Default)]");
@@ -640,9 +642,9 @@ impl Gen<'_> {
             self.line(&format!("pub struct {name} {{}}"));
         } else {
             self.line(&format!("pub struct {name} {{"));
-            for (java, f) in &fields {
-                if java.as_str() != f.rust {
-                    self.line(&format!("    /// Java: `{java}`."));
+            for (_, f) in &fields {
+                if f.java != f.rust {
+                    self.line(&format!("    /// Java: `{}`.", f.java));
                 }
                 self.line(&format!("    pub {}: {},", f.rust, f.ty));
             }

@@ -66,6 +66,10 @@ fn the_crate_has_every_part() {
         "use std::collections::{HashMap, HashSet};",
         "pub last_seen: HashMap<Uuid, i64>,",
         "pub muted: HashSet<Uuid>,",
+        // A listener's own fields and a static one, after the main class's.
+        "    /// Java: `AfkListener.lastMove`.\n    pub last_move: HashMap<Uuid, i64>,",
+        "    /// Java: `AfkListener.lastSpot`.\n    pub last_spot: Option<Location>,",
+        "    /// Java: `AfkListener.mutedMoves`.\n    pub muted_moves: i32,",
         "left out, no Horizon event for EntityDamageEvent",
         "ctx.set_executor(\"heal\"",
         "ctx.set_executor(\"spawn\"",
@@ -74,9 +78,9 @@ fn the_crate_has_every_part() {
         assert!(lib.contains(want), "lib.rs lacks {want}\n{lib}");
     }
     let md = generate::porting_md(&a, "greeter.jar", &generated);
-    assert!(md.contains("| Listeners | 6 (5 with a Horizon event) |"), "{md}");
+    assert!(md.contains("| Listeners | 7 (6 with a Horizon event) |"), "{md}");
     assert!(
-        md.contains("| Translated to Rust | 12 of 14 listeners, commands, completers, tasks and helpers |"),
+        md.contains("| Translated to Rust | 13 of 15 listeners, commands, completers, tasks and helpers |"),
         "{md}"
     );
     assert!(md.contains("`Player.setHealth`"));
@@ -159,6 +163,19 @@ fn bodies_are_translated() {
             };
             let last = plugin.last_seen.get(&target.uuid).cloned();
             if let Some(last) = last {",
+        // A listener's state, the plugin's singleton (`Greeter.getInstance()`), a field that starts null.
+        "        ctx.on(|plugin, _ctx, e: &mut PlayerMoveEvent| {
+            let id = e.player.uuid;
+            plugin.last_move.insert(id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64));
+            plugin.moves += 1;
+            if plugin.muted.contains(&id) {
+                plugin.muted_moves += 1;
+            }
+            if plugin.last_spot.is_some() && plugin.last_spot.as_ref().unwrap().distance(&e.player.location) > 100.0 {
+                e.player.send_message(\"Far from the last spot.\");
+            }
+            plugin.last_spot = Some(e.player.location.clone());
+        });",
         // A list made in the body.
         "            let mut names: Vec<String> = Vec::new();
             for p in server().online_players() {

@@ -22,15 +22,18 @@ import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 
 public final class Greeter extends JavaPlugin implements Listener, CommandExecutor {
+    private static Greeter instance;
     private int joins;
     final Map<UUID, Long> lastSeen = new HashMap<>();
     final Set<UUID> muted = new HashSet<>();
 
     @Override
     public void onEnable() {
+        instance = this;
         saveDefaultConfig();
         getServer().getPluginManager().registerEvents(this, this);
         getServer().getPluginManager().registerEvents(new DamageListener(), this);
+        getServer().getPluginManager().registerEvents(new AfkListener(), this);
         getCommand("heal").setExecutor(new HealCommand(this));
         getCommand("heal").setTabCompleter(new HealCommand(this));
         getCommand("spawn").setExecutor(this);
@@ -39,6 +42,10 @@ public final class Greeter extends JavaPlugin implements Listener, CommandExecut
         getCommand("seen").setTabCompleter(new SeenCommand(this));
         Bukkit.getScheduler().runTaskTimer(this, () -> Bukkit.broadcastMessage(ChatColor.YELLOW + "Joins so far: " + joins), 20L, 1200L);
         getLogger().info("Greeter ready");
+    }
+
+    static Greeter getInstance() {
+        return instance;
     }
 
     @EventHandler

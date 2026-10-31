@@ -25,6 +25,7 @@ public final class Greeter extends JavaPlugin implements Listener, CommandExecut
         getCommand("heal").setExecutor(new HealCommand(this));
         getCommand("heal").setTabCompleter(new HealCommand(this));
         getCommand("spawn").setExecutor(this);
+        getCommand("greet").setExecutor(new GreetCommand());
         Bukkit.getScheduler().runTaskTimer(this, () -> Bukkit.broadcastMessage(ChatColor.YELLOW + "Joins so far: " + joins), 20L, 1200L);
         getLogger().info("Greeter ready");
     }
@@ -32,9 +33,14 @@ public final class Greeter extends JavaPlugin implements Listener, CommandExecut
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
         joins++;
-        String text = getConfig().getString("welcome");
-        event.getPlayer().sendMessage(ChatColor.translateAlternateColorCodes('&', text.replace("%player%", event.getPlayer().getName())));
+        greet(event.getPlayer());
         event.setJoinMessage(null);
+    }
+
+    /** A helper of the plugin's own, calling a static one of another class. */
+    private void greet(Player player) {
+        String text = getConfig().getString("welcome");
+        player.sendMessage(Texts.color(text.replace("%player%", player.getName())));
     }
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)

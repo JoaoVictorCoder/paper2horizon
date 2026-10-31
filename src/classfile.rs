@@ -10,7 +10,18 @@ pub struct Class {
     pub name: String,
     pub super_name: Option<String>,
     pub interfaces: Vec<String>,
+    pub fields: Vec<Field>,
     pub methods: Vec<Method>,
+    pool: Pool,
+    bootstraps: Vec<(u16, Vec<u16>)>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Field {
+    pub name: String,
+    /// `I`, `Ljava/lang/String;`.
+    pub descriptor: String,
+    pub is_static: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -18,8 +29,107 @@ pub struct Method {
     pub name: String,
     /// `(Lorg/bukkit/event/player/PlayerJoinEvent;)V`.
     pub descriptor: String,
+    pub is_static: bool,
     pub annotations: Vec<Annotation>,
     pub code: Code,
+    /// The bytecode, for the translator; `None` for abstract and native methods.
+    pub body: Option<Body>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Body {
+    pub code: Vec<u8>,
+    /// How many exception handlers (`try`/`catch`, `synchronized`) it has.
+    pub handlers: usize,
+    /// The local variables' names, where the class was compiled with them (`-g`, Gradle's and Maven's
+    /// default).
+    pub locals: Vec<LocalVar>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LocalVar {
+    pub slot: u16,
+    pub start: u16,
+    pub len: u16,
+    pub name: String,
+    pub descriptor: String,
+}
+
+/// A constant `ldc` loads.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Const {
+    Int(i32),
+    Long(i64),
+    Float(f32),
+    Double(f64),
+    Str(String),
+    /// A class literal.
+    Class(String),
+}
+
+/// What an `invokedynamic` makes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Indy {
+    /// String concatenation: the recipe (`\u{1}` for each argument, `\u{2}` for each constant) and its
+    /// constants.
+    Concat {
+        recipe: String,
+        constants: Vec<String>,
+    },
+    /// A lambda or method reference, and the method it runs.
+    Lambda(MemberRef),
+    Other,
+}
+
+impl Class {
+    pub fn constant(&self, i: u16) -> Option<Const> {
+        Some(match self.pool.get(i)? {
+            Constant::Int(v) => Const::Int(*v),
+            Constant::Long(v) => Const::Long(*v),
+            Constant::Float(v) => Const::Float(*v),
+            Constant::Double(v) => Const::Double(*v),
+            Constant::String(s) => Const::Str(self.pool.utf8(*s)?.to_owned()),
+            Constant::Class(_) => Const::Class(self.pool.class(i)?.to_owned()),
+            _ => return None,
+        })
+    }
+
+    pub fn member(&self, i: u16) -> Option<MemberRef> {
+        self.pool.member(i)
+    }
+
+    pub fn class_ref(&self, i: u16) -> Option<String> {
+        self.pool.class(i).map(str::to_owned)
+    }
+
+    pub fn indy(&self, i: u16) -> Option<Indy> {
+        let Constant::InvokeDynamic { bootstrap } = self.pool.get(i)? else { return None };
+        let (handle, args) = self.bootstraps.get(*bootstrap as usize)?;
+        let factory = match self.pool.get(*handle)? {
+            Constant::MethodHandle { reference } => self.pool.member(*reference)?,
+            _ => return None,
+        };
+        if factory.owner == "java/lang/invoke/StringConcatFactory" {
+            let mut texts = args.iter().filter_map(|a| match self.pool.get(*a) {
+                Some(Constant::String(s)) => self.pool.utf8(*s).map(str::to_owned),
+                _ => None,
+            });
+            let recipe = texts.next()?;
+            return Some(Indy::Concat { recipe, constants: texts.collect() });
+        }
+        for a in args {
+            if let Some(Constant::MethodHandle { reference }) = self.pool.get(*a) {
+                if let Some(target) = self.pool.member(*reference) {
+                    return Some(Indy::Lambda(target));
+                }
+            }
+        }
+        Some(Indy::Other)
+    }
+
+    pub fn method(&self, name: &str) -> Option<&Method> {
+        self.methods.iter().find(|m| m.name == name)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -60,12 +170,24 @@ pub enum Step {
     This,
     /// A class literal (`BlockBreakEvent.class`).
     ClassLiteral(String),
+    /// A `long` constant (a scheduler's ticks).
+    Long(i64),
+    /// A field read (`getfield`, `getstatic`).
+    Field(MemberRef),
+    /// An object stored to a local variable, or loaded from one (other than `this`).
+    Store(u16),
+    Load(u16),
+    /// A lambda or method reference made, and the method it runs.
+    Lambda(MemberRef),
 }
 
 #[derive(Clone, Debug)]
 enum Constant {
     Utf8(String),
     Int(i32),
+    Long(i64),
+    Float(f32),
+    Double(f64),
     Class(u16),
     String(u16),
     Member {
@@ -112,6 +234,7 @@ impl<'a> Reader<'a> {
     }
 }
 
+#[derive(Clone, Debug, Default)]
 struct Pool(Vec<Constant>);
 
 impl Pool {
@@ -191,13 +314,11 @@ pub fn parse(bytes: &[u8]) -> Result<Class, String> {
                 Constant::Utf8(modified_utf8(r.take(n)?))
             }
             3 => Constant::Int(r.u32()? as i32),
-            4 => {
-                r.take(4)?;
-                Constant::Other
-            }
+            4 => Constant::Float(f32::from_bits(r.u32()?)),
             5 | 6 => {
-                r.take(8)?;
-                pool.push(Constant::Other);
+                let bits = ((r.u32()? as u64) << 32) | r.u32()? as u64;
+                pool.push(if tag == 5 { Constant::Long(bits as i64) } else { Constant::Double(f64::from_bits(bits)) });
+                // A long or double takes two slots.
                 Constant::Unusable
             }
             7 => Constant::Class(r.u16()?),
@@ -229,13 +350,17 @@ pub fn parse(bytes: &[u8]) -> Result<Class, String> {
     for _ in 0..r.u16()? {
         interfaces.extend(pool.class(r.u16()?).map(str::to_owned));
     }
+    let mut fields = Vec::new();
     for _ in 0..r.u16()? {
-        r.take(6)?;
+        let access = r.u16()?;
+        let name = pool.utf8(r.u16()?).unwrap_or_default().to_owned();
+        let descriptor = pool.utf8(r.u16()?).unwrap_or_default().to_owned();
         skip_attributes(&mut r)?;
+        fields.push(Field { name, descriptor, is_static: access & 0x0008 != 0 });
     }
     let mut raw_methods = Vec::new();
     for _ in 0..r.u16()? {
-        r.u16()?;
+        let access = r.u16()?;
         let name = pool.utf8(r.u16()?).unwrap_or_default().to_owned();
         let descriptor = pool.utf8(r.u16()?).unwrap_or_default().to_owned();
         let mut annotations = Vec::new();
@@ -252,7 +377,7 @@ pub fn parse(bytes: &[u8]) -> Result<Class, String> {
                 _ => {}
             }
         }
-        raw_methods.push((name, descriptor, annotations, code));
+        raw_methods.push((name, descriptor, access & 0x0008 != 0, annotations, code));
     }
     // The class's attributes, for BootstrapMethods (lambdas and string concatenation).
     let mut bootstraps: Vec<(u16, Vec<u16>)> = Vec::new();
@@ -271,12 +396,39 @@ pub fn parse(bytes: &[u8]) -> Result<Class, String> {
     }
     let methods = raw_methods
         .into_iter()
-        .map(|(name, descriptor, annotations, code)| {
+        .map(|(name, descriptor, is_static, annotations, code)| {
+            let body = code.map(|c| read_body(c, &pool)).transpose()?;
             let code = code.map(|c| read_code(c, &pool, &bootstraps)).transpose()?.unwrap_or_default();
-            Ok(Method { name, descriptor, annotations, code })
+            Ok(Method { name, descriptor, is_static, annotations, code, body })
         })
         .collect::<Result<_, String>>()?;
-    Ok(Class { name, super_name, interfaces, methods })
+    Ok(Class { name, super_name, interfaces, fields, methods, pool, bootstraps })
+}
+
+/// A `Code` attribute's bytecode, exception handlers and local variable names.
+fn read_body(body: &[u8], pool: &Pool) -> Result<Body, String> {
+    let mut r = Reader { bytes: body, at: 0 };
+    r.take(4)?; // max stack and locals
+    let len = r.u32()? as usize;
+    let code = r.take(len)?.to_vec();
+    let handlers = r.u16()? as usize;
+    r.take(handlers * 8)?;
+    let mut locals = Vec::new();
+    for _ in 0..r.u16()? {
+        let attr = pool.utf8(r.u16()?).unwrap_or_default().to_owned();
+        let n = r.u32()? as usize;
+        let data = r.take(n)?;
+        if attr == "LocalVariableTable" {
+            let mut l = Reader { bytes: data, at: 0 };
+            for _ in 0..l.u16()? {
+                let (start, len) = (l.u16()?, l.u16()?);
+                let name = pool.utf8(l.u16()?).unwrap_or_default().to_owned();
+                let descriptor = pool.utf8(l.u16()?).unwrap_or_default().to_owned();
+                locals.push(LocalVar { slot: l.u16()?, start, len, name, descriptor });
+            }
+        }
+    }
+    Ok(Body { code, handlers, locals })
 }
 
 fn skip_attributes(r: &mut Reader) -> Result<(), String> {
@@ -337,7 +489,7 @@ fn read_element(r: &mut Reader, pool: &Pool) -> Result<String, String> {
 }
 
 /// The length of the instruction at `pc` (its opcode included); `None` for an unknown opcode.
-fn instruction_len(code: &[u8], pc: usize) -> Option<usize> {
+pub fn instruction_len(code: &[u8], pc: usize) -> Option<usize> {
     let op = *code.get(pc)?;
     let fixed = match op {
         0x00..=0x0f | 0x1a..=0x35 | 0x3b..=0x83 | 0x85..=0x98 | 0xac..=0xb1 | 0xbe | 0xbf | 0xc2 | 0xc3 => 1,
@@ -381,6 +533,16 @@ fn read_code(body: &[u8], pool: &Pool, bootstraps: &[(u16, Vec<u16>)]) -> Result
         }
         match op {
             0x2a => out.steps.push(Step::This),
+            0x2b..=0x2d => out.steps.push(Step::Load((op - 0x2a) as u16)),
+            0x19 => out.steps.push(Step::Load(code[pc + 1] as u16)),
+            0x4b..=0x4e => out.steps.push(Step::Store((op - 0x4b) as u16)),
+            0x3a => out.steps.push(Step::Store(code[pc + 1] as u16)),
+            0x09 | 0x0a => out.steps.push(Step::Long(op as i64 - 9)),
+            0x14 => {
+                if let Some(Constant::Long(v)) = pool.get(u16_at(pc)) {
+                    out.steps.push(Step::Long(*v));
+                }
+            }
             0x12 | 0x13 => {
                 let i = if op == 0x12 { code[pc + 1] as u16 } else { u16_at(pc) };
                 match pool.get(i) {
@@ -399,6 +561,9 @@ fn read_code(body: &[u8], pool: &Pool, bootstraps: &[(u16, Vec<u16>)]) -> Result
             }
             0xb2..=0xb5 => {
                 if let Some(m) = pool.member(u16_at(pc)) {
+                    if op == 0xb2 || op == 0xb4 {
+                        out.steps.push(Step::Field(m.clone()));
+                    }
                     if seen_fields.insert(m.clone()) {
                         out.fields.push(m);
                     }
@@ -456,7 +621,7 @@ fn read_indy(pool: &Pool, bootstrap: Option<&(u16, Vec<u16>)>, out: &mut Code) {
     for a in args {
         if let Some(Constant::MethodHandle { reference }) = pool.get(*a) {
             if let Some(target) = pool.member(*reference) {
-                out.steps.push(Step::Call(target.clone()));
+                out.steps.push(Step::Lambda(target.clone()));
                 if !out.lambdas.contains(&target.name) {
                     out.lambdas.push(target.name.clone());
                 }

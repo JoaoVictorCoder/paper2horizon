@@ -10,16 +10,58 @@ are. paper2horizon reads the jar (no source code needed) and writes:
 - **`plugin.yml`** as it was (Horizon reads Bukkit's), or one made from `paper-plugin.yml`;
 - the plugin's **resources** (`config.yml`, `messages.yml`, `lang/`...);
 - **`src/lib.rs`**: a listener for each `@EventHandler` on the matching Horizon event, with its priority and
-  `ignoreCancelled`; an executor and a tab completer for each command; the tasks `onEnable` schedules;
-  `ctx.save_default_config` when the plugin saves its `config.yml`. Each one holds a `TODO` that lists what the
-  Java code called, each call mapped to its horizon-plugin-api equivalent (or why there is none yet), the
-  constants it read (`Material.BEDROCK` → `"minecraft:bedrock"`) and the text it used;
+  `ignoreCancelled`; an executor and a tab completer for each command; the tasks `onEnable` schedules, with their
+  ticks; the main class's simple fields as the plugin's fields; `ctx.save_default_config` when the plugin saves
+  its `config.yml`. **Method bodies are translated to Rust** where paper2horizon can (below); the others hold a
+  `TODO` that lists what the Java code called, each call mapped to its horizon-plugin-api equivalent (or why there
+  is none yet), the constants it read (`Material.BEDROCK` → `"minecraft:bedrock"`) and the text it used;
 - **`PORTING.md`**: a summary, the listeners and commands, what the plugin needs that Horizon lacks, bundled
   libraries, and warnings (plugins that reach into Minecraft's own code or CraftBukkit, Brigadier commands,
   dependencies on other plugins).
 
-The crate compiles as it is: the plugin loads, registers its commands and listens to its events, doing nothing
-until each `TODO` is ported. The method bodies themselves are not translated.
+The crate compiles as it is: the plugin loads, registers its commands and listens to its events. What was
+translated works; each `TODO` does nothing until it is ported.
+
+## Translating method bodies
+
+The bytecode of each listener, command, tab completer and task is run symbolically, with typed expressions on its
+stack, and comes back as Rust: calls through the same tables as the notes, `if`/`else` (and `&&`), `switch`
+(strings too) as `match`, `for (Player p : players)` loops, locals with their Java names, string concatenation as
+`format!`, the plugin's fields, and the plugin's own methods as Rust functions (translated the same way, as they
+are called). A body translates whole or not at all: a `try`, another kind of loop, a call or a type with no Rust
+form here leaves it a `TODO` saying why.
+
+Then paper2horizon runs `cargo check` on the crate and turns every translation that doesn't compile back into a
+`TODO` (with the translation as a comment to finish), until the crate compiles. `--no-check` skips that.
+
+```rust
+// Java: switch (args[0].toLowerCase()) { case "all": case "everyone": for (Player p : Bukkit.getOnlinePlayers()) ...
+ctx.set_executor("greet", |_plugin, _ctx, sender, _label, args| {
+    if args.is_empty() {
+        return false;
+    }
+    match args[0].to_lowercase().as_str() {
+        "all" | "everyone" => {
+            for p in server().online_players() {
+                p.send_message(&format!("{}Hello from {}!", ChatColor::Green, sender.name()));
+            }
+        }
+        "me" => {
+            sender.send_message(&format!("Hello, {}.", sender.name()));
+        }
+        _ => {
+            sender.send_message(&format!("{}Unknown: {}", ChatColor::Red, args[0]));
+            return true;
+        }
+    }
+    true
+});
+```
+
+Read translated code over: Java's `null` and Rust's defaults differ (`getConfig().getString(path)` is `""` here when
+the key is missing, not `null`). On 66 small plugins from Modrinth, 18 of 277 bodies translate today, and every
+crate compiles; most of the rest keep state in collections (`Map<UUID, Long>`, `Set<UUID>`) or singletons, which is
+next (TODO.md).
 
 ## Use
 
@@ -66,10 +108,13 @@ ctx.listen(EventPriority::High, true, |_plugin, _ctx, _e: &mut BlockBreakEvent| 
   Bukkit call. Jars inside the jar are read too; libraries bundled or relocated into the plugin are told apart.
 - `src/mapping.rs` holds what Bukkit and Paper name in horizon-plugin-api: events, methods and constants. A new
   part of the API means a new line there; a test checks that every event it maps to exists in the API.
+- `src/translate.rs` translates method bodies (above); `src/verify.rs` runs `cargo check` and finds the lines that
+  fail.
 - `src/generate.rs` writes the crate.
 
-Tried on CoreProtect, LuckPerms, ViaVersion, WorldEdit, TAB, Chunky, Simple Voice Chat, AxGraves and VeinMiner:
-each converts, and each crate compiles.
+Tried on CoreProtect, LuckPerms, ViaVersion, WorldEdit, TAB, Chunky, Simple Voice Chat, AxGraves and VeinMiner,
+and on 66 small plugins: each converts, and each crate compiles. The big ones translate no bodies yet: their
+listeners hand everything to their own frameworks.
 
 ## Development
 

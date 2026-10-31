@@ -5,3 +5,5 @@ pub mod analysis;
 pub mod classfile;
 pub mod generate;
 pub mod mapping;
+pub mod translate;
+pub mod verify;

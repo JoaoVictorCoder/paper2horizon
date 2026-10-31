@@ -182,14 +182,28 @@ pub struct Command {
     pub declared: bool,
     pub executor: Option<(String, Uses)>,
     pub completer: Option<(String, Uses)>,
+    /// The executor's method: `onCommand`, or the lambda or method reference handed to setExecutor.
+    pub executor_method: String,
+    pub completer_method: String,
 }
 
 /// One of the main class's `onEnable`, `onDisable`, `onLoad`.
+/// A task `onEnable` schedules.
+pub struct Task {
+    /// The scheduler call (`runTaskTimer`).
+    pub call: MemberRef,
+    pub uses: Uses,
+    /// The main class's method the task runs (`lambda$onEnable$0`), when it is a lambda.
+    pub lambda: Option<String>,
+    /// The delay and period in ticks, when the Java code passes constants.
+    pub ticks: Vec<i64>,
+}
+
 pub struct Lifecycle {
     pub uses: Uses,
     pub calls_save_default_config: bool,
     /// Scheduler calls it makes, each with what its task does.
-    pub tasks: Vec<(MemberRef, Uses)>,
+    pub tasks: Vec<Task>,
 }
 
 pub struct Analysis {
@@ -214,6 +228,16 @@ pub struct Analysis {
     /// The plugin's own classes that reach into the server's internals (Minecraft's code, CraftBukkit),
     /// with how many such references each makes.
     pub internals: Vec<(String, usize)>,
+    /// Every class of the jar, for the translator.
+    pub classes: Vec<Class>,
+    /// The plugin struct's fields, by the main class's field names.
+    pub fields: BTreeMap<String, crate::translate::PluginField>,
+}
+
+impl Analysis {
+    pub fn class(&self, name: &str) -> Option<&Class> {
+        self.classes.iter().find(|c| c.name == name)
+    }
 }
 
 /// Minecraft's own code and CraftBukkit's: what plugins reach with reflection or NMS. Nothing of it
@@ -233,27 +257,6 @@ struct Index<'a> {
 impl<'a> Index<'a> {
     fn method(&self, class: &str, name: &str) -> Option<&'a Method> {
         self.classes.get(class)?.methods.iter().find(|m| m.name == name)
-    }
-
-    /// Whether `class` or one of its super classes (in the jar) implements `interface` or extends it.
-    fn is_a(&self, class: &str, interface: &str) -> bool {
-        let mut at = Some(class.to_owned());
-        let mut guard = 0;
-        while let Some(c) = at {
-            if c == interface {
-                return true;
-            }
-            let Some(k) = self.classes.get(c.as_str()) else { return false };
-            if k.interfaces.iter().any(|i| i == interface || self.is_a(i, interface)) {
-                return true;
-            }
-            at = k.super_name.clone();
-            guard += 1;
-            if guard > 32 {
-                return false;
-            }
-        }
-        false
     }
 
     /// What `method` of `class` uses, with its lambdas' code (and theirs) folded in.
@@ -374,31 +377,67 @@ pub fn analyze(jar: Jar) -> Result<Analysis, String> {
     }
 
     // Commands: what plugin.yml declares, and which class each `getCommand(name).setExecutor(x)` hands it to.
-    let mut executors: BTreeMap<String, String> = BTreeMap::new();
-    let mut completers: BTreeMap<String, String> = BTreeMap::new();
+    // Command → (class, method): `onCommand`/`onTabComplete`, or a lambda's method.
+    let mut executors: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
+    let mut completers: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
+    // Commands handed to an executor the analysis can't tell.
+    let mut unknown: BTreeSet<String> = BTreeSet::new();
     let mut brigadier = false;
     for class in jar.classes.iter().filter(|c| own(&c.name)) {
         for m in &class.methods {
             let mut name: Option<String> = None;
             let mut last_string: Option<String> = None;
-            let mut last_new: Option<String> = None;
+            // The object handed to setExecutor: `this`, `new X(...)` (constructors may nest) or a
+            // field's value; `Some(None)` when it is something else.
+            let mut object: Option<Option<(String, Option<String>)>> = None;
+            let mut constructing: Vec<String> = Vec::new();
+            let mut locals: BTreeMap<u16, Option<(String, Option<String>)>> = BTreeMap::new();
+            let in_jar = |c: &str| index.classes.contains_key(c);
             for step in &m.code.steps {
                 match step {
                     Step::String(s) => last_string = Some(s.clone()),
-                    Step::New(c) => last_new = Some(c.clone()),
-                    Step::This | Step::ClassLiteral(_) => {}
+                    Step::New(c) => constructing.push(c.clone()),
+                    Step::Call(c) if c.name == "<init>" && constructing.last() == Some(&c.owner) => {
+                        constructing.pop();
+                        if constructing.is_empty() {
+                            object = Some(in_jar(&c.owner).then(|| (c.owner.clone(), None)));
+                        }
+                    }
+                    Step::This if constructing.is_empty() => object = Some(Some((class.name.clone(), None))),
+                    Step::Field(f) if constructing.is_empty() => {
+                        let ty = f.descriptor.strip_prefix('L').and_then(|d| d.strip_suffix(';')).map(str::to_owned);
+                        object = Some(ty.filter(|t| in_jar(t)).map(|t| (t, None)));
+                    }
+                    Step::Lambda(t) if constructing.is_empty() => {
+                        object = Some(in_jar(&t.owner).then(|| (t.owner.clone(), Some(t.name.clone()))));
+                    }
+                    Step::Store(slot) if constructing.is_empty() => {
+                        locals.insert(*slot, object.take().flatten());
+                    }
+                    Step::Load(slot) if constructing.is_empty() => object = Some(locals.get(slot).cloned().flatten()),
+                    Step::This
+                    | Step::Field(_)
+                    | Step::ClassLiteral(_)
+                    | Step::Long(_)
+                    | Step::Store(_)
+                    | Step::Load(_)
+                    | Step::Lambda(_) => {}
                     Step::Call(c) if c.name == "getCommand" => {
                         name = last_string.take().map(|s| s.to_ascii_lowercase());
-                        last_new = None;
+                        object = None;
+                        constructing.clear();
                     }
                     Step::Call(c) if c.name == "setExecutor" || c.name == "setTabCompleter" => {
                         if let Some(n) = &name {
-                            let by = last_new
-                                .clone()
-                                .filter(|k| index.classes.contains_key(k.as_str()))
-                                .unwrap_or_else(|| class.name.clone());
                             let map = if c.name == "setExecutor" { &mut executors } else { &mut completers };
-                            map.insert(n.clone(), by);
+                            match object.clone().flatten() {
+                                Some(by) => {
+                                    map.insert(n.clone(), by);
+                                }
+                                None => {
+                                    unknown.insert(n.clone());
+                                }
+                            }
                         }
                     }
                     Step::Call(c)
@@ -413,8 +452,8 @@ pub fn analyze(jar: Jar) -> Result<Analysis, String> {
             }
         }
     }
-    let main_handles =
-        index.is_a(&main, "org/bukkit/command/CommandExecutor") || index.method(&main, "onCommand").is_some();
+    // JavaPlugin runs its own onCommand for the commands no other executor took, when it has one.
+    let main_handles = index.method(&main, "onCommand").is_some();
     let mut names: Vec<(String, bool)> = description.commands.iter().map(|c| (c.name.clone(), true)).collect();
     for n in executors.keys().chain(completers.keys()) {
         if !names.iter().any(|(x, _)| x == n) {
@@ -425,20 +464,31 @@ pub fn analyze(jar: Jar) -> Result<Analysis, String> {
         .into_iter()
         .map(|(name, declared)| {
             // JavaPlugin is itself the executor and completer of its commands until another is set.
-            let executor = executors.get(&name).cloned().or_else(|| main_handles.then(|| main.clone()));
+            let executor = executors
+                .get(&name)
+                .cloned()
+                .or_else(|| (main_handles && !unknown.contains(&name)).then(|| (main.clone(), None)));
             let completer = completers.get(&name).cloned().or_else(|| {
-                let by = executor.clone()?;
-                index.method(&by, "onTabComplete").map(|_| by)
+                let (by, lambda) = executor.clone()?;
+                if lambda.is_some() {
+                    return None;
+                }
+                index.method(&by, "onTabComplete").map(|_| (by, None))
             });
+            let executor_method = executor.as_ref().and_then(|e| e.1.clone()).unwrap_or_else(|| "onCommand".into());
+            let completer_method =
+                completer.as_ref().and_then(|e| e.1.clone()).unwrap_or_else(|| "onTabComplete".into());
             Command {
-                executor: executor.map(|c| {
-                    let u = index.uses(&c, "onCommand");
+                executor: executor.map(|(c, _)| {
+                    let u = index.uses(&c, &executor_method);
                     (c, u)
                 }),
-                completer: completer.map(|c| {
-                    let u = index.uses(&c, "onTabComplete");
+                completer: completer.map(|(c, _)| {
+                    let u = index.uses(&c, &completer_method);
                     (c, u)
                 }),
+                executor_method,
+                completer_method,
                 name,
                 declared,
             }
@@ -452,22 +502,32 @@ pub fn analyze(jar: Jar) -> Result<Analysis, String> {
         let mut task_lambdas = Vec::new();
         // A scheduler call takes the lambda made just before it.
         let mut lambda: Option<String> = None;
+        let mut longs: Vec<i64> = Vec::new();
         for step in &m.code.steps {
-            if let Step::Call(c) = step {
-                if c.owner == main && c.name.starts_with("lambda$") {
+            if let Step::Long(v) = step {
+                longs.push(*v);
+            }
+            if let Step::Lambda(c) = step {
+                if c.owner == main {
                     lambda = Some(c.name.clone());
-                } else if matches!(mapping::simple_name(&c.owner), "BukkitScheduler" | "BukkitRunnable")
+                }
+            }
+            if let Step::Call(c) = step {
+                if matches!(mapping::simple_name(&c.owner), "BukkitScheduler" | "BukkitRunnable")
                     && (c.name.starts_with("run") || c.name.starts_with("schedule"))
                 {
-                    let uses = lambda
-                        .take()
-                        .map(|l| {
-                            let u = index.uses(&main, &l);
-                            task_lambdas.push(l);
-                            u
-                        })
-                        .unwrap_or_default();
-                    tasks.push((c.clone(), uses));
+                    let lambda = lambda.take();
+                    let uses = lambda.as_ref().map(|l| index.uses(&main, l)).unwrap_or_default();
+                    task_lambdas.extend(lambda.clone());
+                    // runTaskTimer(plugin, task, delay, period) takes the last two; runTaskLater the last.
+                    let want = match c.name.as_str() {
+                        "runTaskTimer" | "scheduleSyncRepeatingTask" | "runTaskTimerAsynchronously" => 2,
+                        "runTaskLater" | "scheduleSyncDelayedTask" | "runTaskLaterAsynchronously" => 1,
+                        _ => 0,
+                    };
+                    let ticks = if longs.len() >= want { longs[longs.len() - want..].to_vec() } else { Vec::new() };
+                    longs.clear();
+                    tasks.push(Task { call: c.clone(), uses, lambda, ticks });
                 }
             }
         }
@@ -483,8 +543,11 @@ pub fn analyze(jar: Jar) -> Result<Analysis, String> {
         covered.insert((l.class.clone(), l.method.clone()));
     }
     for (_, c) in executors.iter().chain(completers.iter()) {
-        covered.insert((c.clone(), "onCommand".into()));
-        covered.insert((c.clone(), "onTabComplete".into()));
+        covered.insert((c.0.clone(), "onCommand".into()));
+        covered.insert((c.0.clone(), "onTabComplete".into()));
+        if let Some(l) = &c.1 {
+            covered.insert((c.0.clone(), l.clone()));
+        }
     }
     if main_handles {
         covered.insert((main.clone(), "onCommand".into()));
@@ -525,10 +588,14 @@ pub fn analyze(jar: Jar) -> Result<Analysis, String> {
         *libraries.entry(relocated(&c.name).unwrap_or_else(|| library_name(&c.name))).or_default() += 1;
     }
 
+    let (on_enable, on_disable, on_load) = (lifecycle("onEnable"), lifecycle("onDisable"), lifecycle("onLoad"));
+    let fields = index.classes.get(main.as_str()).map(|c| crate::translate::plugin_fields(c)).unwrap_or_default();
     Ok(Analysis {
-        on_enable: lifecycle("onEnable"),
-        on_disable: lifecycle("onDisable"),
-        on_load: lifecycle("onLoad"),
+        on_enable,
+        on_disable,
+        on_load,
+        fields,
+        classes: jar.classes,
         description,
         plugin_yml: jar.plugin_yml,
         from_paper_yml: jar.from_paper_yml,

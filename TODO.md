@@ -2,12 +2,21 @@
 
 ## Next
 
-- [ ] Translate simple method bodies, not only list their calls: a straight line of mapped calls
-      (`event.getPlayer().sendMessage("...")` → `e.player.send_message("...")`), from the bytecode's stack.
-- [ ] Read the delay and period a scheduler call passes (`runTaskTimer(this, task, 20L, 1200L)`) instead of a TODO.
-- [ ] The main class's fields, as fields of the plugin's struct (with Rust types for the common Java ones).
-- [ ] Follow calls into the plugin's own helpers (a listener calling `Util.send(player, ...)`) and list their API
-      calls under the listener.
+What keeps bodies from translating, most common first (66 small plugins from Modrinth, 18 of 277 translated):
+
+- [ ] State in collections: fields typed `Map<UUID, Long>`, `Set<UUID>`, `List<String>` (from their generic
+      `Signature`) as `HashMap`, `HashSet`, `Vec`, with `get` giving an `Option`.
+- [ ] `null`: `Option` for what can be missing (`Bukkit.getPlayer(name)`, `map.get(k)`), `if (x != null)` as
+      `if let Some(x)`.
+- [ ] Static fields and singletons (`Main.getInstance()`, `ConfigHandler.INSTANCE`): the plugin itself.
+- [ ] Fields of listener and command classes other than the plugin reference: fields of the plugin's struct.
+- [ ] `try { Integer.parseInt(s) } catch (NumberFormatException e)` as `match s.parse::<i32>()`.
+- [ ] `||` in conditions, `?:`, `continue` and `break` in loops, index loops (`for (int i = 0; ...)`).
+- [ ] Lambdas inside bodies (`runTaskLater(this, () -> ..., 20L)` in a listener): closures.
+- [x] Translate method bodies: listeners, commands, completers, tasks, and the plugin's own methods they call, with
+      `cargo check` taking back what doesn't compile.
+- [x] Read the delay and period a scheduler call passes.
+- [x] The main class's simple fields, as fields of the plugin's struct.
 - [ ] Commands registered through Paper's Brigadier lifecycle events: their names, from the string literals.
 - [ ] Java sources (`src/main/java`) as input, for plugins whose source is at hand: comments, names and generics.
 

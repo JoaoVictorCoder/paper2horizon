@@ -12,6 +12,9 @@ commands:
     aliases: [h]
   spawn:
     description: Go to the world's spawn
+  greet:
+    description: Greet everyone, or yourself
+    usage: /greet <all|me>
 permissions:
   greeter.heal:
     default: op

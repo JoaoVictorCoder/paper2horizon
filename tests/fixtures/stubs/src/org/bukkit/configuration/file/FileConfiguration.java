@@ -1,0 +1,1 @@
+package org.bukkit.configuration.file; public abstract class FileConfiguration { public String getString(String p) { return null; } public int getInt(String p) { return 0; } public boolean getBoolean(String p) { return false; } }

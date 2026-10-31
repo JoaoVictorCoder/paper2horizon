@@ -1,0 +1,1 @@
+package org.bukkit.event.entity; public class EntityDamageEvent extends org.bukkit.event.Event implements org.bukkit.event.Cancellable { public org.bukkit.entity.Entity getEntity() { return null; } public void setDamage(double d) {} public boolean isCancelled() { return false; } public void setCancelled(boolean c) {} }

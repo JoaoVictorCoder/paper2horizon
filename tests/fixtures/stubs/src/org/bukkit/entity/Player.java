@@ -1,0 +1,1 @@
+package org.bukkit.entity; public interface Player extends Entity, org.bukkit.command.CommandSender { void setHealth(double h); double getMaxHealth(); void kickPlayer(String r); void sendTitle(String t, String s, int a, int b, int c); org.bukkit.inventory.PlayerInventory getInventory(); }

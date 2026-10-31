@@ -1,0 +1,1 @@
+package org.bukkit.scheduler; public interface BukkitScheduler { BukkitTask runTaskTimer(org.bukkit.plugin.Plugin p, Runnable r, long d, long t); BukkitTask runTaskLater(org.bukkit.plugin.Plugin p, Runnable r, long d); BukkitTask runTaskAsynchronously(org.bukkit.plugin.Plugin p, Runnable r); }

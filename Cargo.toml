@@ -1,0 +1,13 @@
+[package]
+name = "paper2horizon"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+description = "Turns a Paper/Bukkit plugin .jar into a horizon-plugin-api crate to finish porting"
+repository = "https://github.com/JoaoVictorCoder/paper2horizon"
+
+[dependencies]
+# plugin.yml is read the way a Horizon server reads it.
+horizon-plugin-api = { git = "https://github.com/JoaoVictorCoder/horizon-server-plugins" }
+zip = { version = "2", default-features = false, features = ["deflate"] }

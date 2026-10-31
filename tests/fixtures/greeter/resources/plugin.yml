@@ -1,0 +1,19 @@
+name: Greeter
+version: 1.2.0
+main: com.example.greeter.Greeter
+api-version: '1.21'
+description: Greets players and heals them
+author: example
+commands:
+  heal:
+    description: Heal yourself or a player
+    usage: /heal [player]
+    permission: greeter.heal
+    aliases: [h]
+  spawn:
+    description: Go to the world's spawn
+permissions:
+  greeter.heal:
+    default: op
+  greeter.bedrock:
+    default: false
